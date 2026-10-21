@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * drm_guard.c - Widevine "deviceUniqueId" interception, M1.3 (dry-run).
+ * drm_guard.c - Widevine "deviceUniqueId" interception, M2 (opt-in write).
  *
  * Recognition rules, carried over from the SKP device identity module (DRMID
  * 1.4.0 / kernel_context.h + binder_hook_builder.cpp):
@@ -37,6 +37,7 @@
 #include <linux/seq_file.h>
 #include <linux/atomic.h>
 #include <linux/string.h>
+#include <linux/random.h>
 #include <linux/types.h>
 #include <uapi/linux/android/binder.h>
 
@@ -81,6 +82,8 @@ struct drm_stats {
 	atomic64_t wsz_nonzero;
 	atomic64_t rcons_nonzero;
 	atomic64_t arg_miss;
+	atomic64_t replaced;
+	atomic64_t first_hit;
 	atomic64_t reported;
 };
 
@@ -99,6 +102,37 @@ static struct drm_call g_call[DRM_PEND_SLOTS];
 static u32 g_hal_tgids[DRM_HAL_LIMIT];
 static u32 g_hal_count;
 static u32 g_hal_enforce;
+
+/* The value every Widevine client will see once g_replace is turned on. */
+static u8 g_virtual_id[DRM_ID_BYTES];
+static u32 g_replace;
+
+static int drm_hexval(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+/* "64 hex chars" -> 32 bytes. */
+static bool drm_parse_vid(const char *hex, u8 *out)
+{
+	int i;
+
+	for (i = 0; i < DRM_ID_BYTES; i++) {
+		int hi = drm_hexval(hex[i * 2]);
+		int lo = drm_hexval(hex[i * 2 + 1]);
+
+		if (hi < 0 || lo < 0)
+			return false;
+		out[i] = (u8)((hi << 4) | lo);
+	}
+	return true;
+}
 
 static bool drm_gate_active(void)
 {
@@ -140,7 +174,7 @@ static void drm_pend_store(u64 task, u32 tid, u32 code)
 
 /* Consume the pending request of this thread.  A miss is the normal case for the
  * many binder reads that are not DRM property lookups. */
-static bool drm_pend_take(u64 task, u32 tid, u32 *code)
+static bool __maybe_unused drm_pend_take(u64 task, u32 tid, u32 *code)
 {
 	struct drm_pend *slot = &g_pend[drm_pend_index(task)];
 
@@ -336,7 +370,10 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 	}
 }
 
-/* Walk the read stream (BR_* commands) looking for the 32-byte reply. */
+/* Walk the read stream (BR_* commands).  A Widevine reply for
+ * getPropertyByteArray("deviceUniqueId") is laid out as
+ *     u32 status(0) | u32 length(32) | u8 id[32]
+ * so the payload is exactly 40 bytes and the id starts at +8. */
 static bool drm_scan_read_stream(struct binder_write_read *bwr)
 {
 	/* Valid at exit: the driver has already written the reply stream. */
@@ -364,17 +401,36 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 					   sizeof(td)))
 				return false;
 			step = sizeof(u32) + sizeof(td);
-			if (cmd == BR_REPLY && td.data_size >= 8 &&
+			if (cmd == BR_REPLY &&
+			    td.data_size >= DRM_ID_BYTES + 8 &&
+			    td.data_size <= DRM_ID_BYTES + 8 + 32 &&
 			    td.data.ptr.buffer) {
+				void __user *payload =
+					(void __user *)td.data.ptr.buffer;
 				u32 hdr[2];
 
-				if (copy_from_user(
-					    hdr,
-					    (const void __user *)td.data.ptr.buffer,
-					    sizeof(hdr)))
+				if (copy_from_user(hdr, payload, sizeof(hdr)))
 					return false;
-				if (hdr[0] == 0 && hdr[1] == DRM_ID_BYTES)
+				if (hdr[0] == 0 && hdr[1] == DRM_ID_BYTES) {
 					candidate = true;
+					if (READ_ONCE(g_replace)) {
+						u8 __user *dst =
+							(u8 __user *)payload + 8;
+
+						if (!copy_to_user(
+							    dst,
+							    g_virtual_id,
+							    DRM_ID_BYTES)) {
+							atomic64_inc(
+							  &g_stats.replaced);
+							if (!atomic64_read(
+							      &g_stats.first_hit))
+								atomic64_set(
+								  &g_stats.first_hit,
+								  1);
+						}
+					}
+				}
 			}
 			break;
 		case BR_INCREFS:
@@ -466,7 +522,6 @@ static void drm_post_handler(struct kprobe *kp, struct pt_regs *regs,
 {
 	struct binder_write_read bwr;
 	unsigned long arg;
-	u32 code = 0;
 
 	(void)kp;
 	(void)regs;
@@ -495,15 +550,15 @@ static void drm_post_handler(struct kprobe *kp, struct pt_regs *regs,
 		return;
 
 	atomic64_inc(&g_stats.reply_candidates);
-	if (!drm_pend_take((u64)(uintptr_t)current, current->pid, &code)) {
-		atomic64_inc(&g_stats.pend_miss);
+	if (!READ_ONCE(g_replace)) {
+		atomic64_inc(&g_stats.would_replace);
+		if (atomic64_inc_return(&g_stats.reported) <= 6)
+			pr_info("DRM ID reply seen tgid=%d (dry-run, nothing written)\n",
+				current->tgid);
 		return;
 	}
-
-	atomic64_inc(&g_stats.would_replace);
 	if (atomic64_inc_return(&g_stats.reported) <= 6)
-		pr_info("WOULD-REPLACE tgid=%d code=%u (dry-run, nothing written)\n",
-			current->tgid, code);
+		pr_info("DRM ID replaced tgid=%d\n", current->tgid);
 }
 
 static struct kprobe g_drm_kp = {
@@ -544,7 +599,15 @@ static void drm_probe_disarm(void)
 
 static int drm_proc_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "mode=dry-run\n");
+	seq_printf(m, "mode=%s\n", READ_ONCE(g_replace) ? "write" : "dry-run");
+	{
+		int i;
+
+		seq_puts(m, "virtual_id=");
+		for (i = 0; i < DRM_ID_BYTES; i++)
+			seq_printf(m, "%02x", g_virtual_id[i]);
+		seq_puts(m, "\n");
+	}
 	seq_printf(m, "probe=%s\n",
 		   g_drm_kp.symbol_name ? g_drm_kp.symbol_name : "off");
 	seq_printf(m, "hal_enforce=%u hal_count=%u\n",
@@ -575,6 +638,7 @@ static int drm_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "rcons_nonzero=%lld\n",
 		   atomic64_read(&g_stats.rcons_nonzero));
 	seq_printf(m, "arg_miss=%lld\n", atomic64_read(&g_stats.arg_miss));
+	seq_printf(m, "replaced=%lld\n", atomic64_read(&g_stats.replaced));
 	seq_printf(m, "would_replace=%lld\n",
 		   atomic64_read(&g_stats.would_replace));
 	return 0;
@@ -588,7 +652,7 @@ static int drm_proc_open(struct inode *inode, struct file *file)
 static ssize_t drm_proc_write(struct file *file, const char __user *ubuf,
 			      size_t count, loff_t *ppos)
 {
-	char buf[64];
+	char buf[80];
 	size_t len = min_t(size_t, count, sizeof(buf) - 1);
 	u32 tgid = 0;
 	u32 i;
@@ -596,7 +660,29 @@ static ssize_t drm_proc_write(struct file *file, const char __user *ubuf,
 	if (copy_from_user(buf, ubuf, len))
 		return -EFAULT;
 	buf[len] = '\0';
+	strim(buf);
 
+	if (sysfs_streq(buf, "write") || sysfs_streq(buf, "on")) {
+		WRITE_ONCE(g_replace, 1);
+		pr_info("replacement ON\n");
+		return count;
+	}
+	if (sysfs_streq(buf, "dry") || sysfs_streq(buf, "dry-run")) {
+		WRITE_ONCE(g_replace, 0);
+		pr_info("replacement OFF (dry-run)\n");
+		return count;
+	}
+	if (!strncmp(buf, "vid ", 4)) {
+		u8 tmp[DRM_ID_BYTES];
+		const char *hex = buf + 4;
+
+		if (strlen(hex) < DRM_ID_BYTES * 2 ||
+		    !drm_parse_vid(hex, tmp))
+			return -EINVAL;
+		memcpy(g_virtual_id, tmp, DRM_ID_BYTES);
+		pr_info("virtual id updated\n");
+		return count;
+	}
 	if (sysfs_streq(buf, "off") || sysfs_streq(buf, "reset")) {
 		WRITE_ONCE(g_hal_enforce, 0);
 		WRITE_ONCE(g_hal_count, 0);
@@ -643,6 +729,11 @@ int drm_guard_init(void)
 	memset(&g_pend, 0, sizeof(g_pend));
 	memset(g_call, 0, sizeof(g_call));
 	memset(g_hal_tgids, 0, sizeof(g_hal_tgids));
+
+	/* A fresh random identity unless user space installs a fixed one. */
+	get_random_bytes(g_virtual_id, DRM_ID_BYTES);
+	pr_info("virtual id %*phN (dry-run until 'echo write')\n",
+		DRM_ID_BYTES, g_virtual_id);
 
 	ret = drm_probe_arm();
 	if (ret)
