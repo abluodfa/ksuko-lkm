@@ -1,6 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * drm_guard.c - Widevine "deviceUniqueId" interception, M2 (opt-in write).
+ * drm_guard.c - Widevine "deviceUniqueId" interception, M3 (scoped, opt-in write).
+ *
+ * Cost control, which is the whole point of M3:
+ *
+ *   - binder_ioctl(filp, cmd, arg) is called ~1.5M times on this device.  The
+ *     command word sits in a register, so everything that is not
+ *     BINDER_WRITE_READ leaves after one compare (cmd_skip).
+ *   - Of what is left, only write streams of at most DRM_WRITE_MAX bytes can
+ *     carry a getPropertyByteArray parcel; bulk streams are dropped without
+ *     touching user memory (big_skip).
+ *   - The exit hook only scans reads of a tgid that asked for deviceUniqueId
+ *     within the last DRM_WATCH_TTL reads (watch_hits / pend_miss), so user
+ *     memory is read a few dozen times instead of a million.
  *
  * Recognition rules, carried over from the SKP device identity module (DRMID
  * 1.4.0 / kernel_context.h + binder_hook_builder.cpp):
@@ -42,6 +54,7 @@
 #include <uapi/linux/android/binder.h>
 
 #include "drm_guard.h"
+#include "susfs_kprobe.h"
 
 #define DRM_ID_BYTES 32
 #define DRM_SCAN_BYTES 4096
@@ -49,8 +62,17 @@
 #define DRM_OVERLAP_BYTES 48
 #define DRM_PARCEL_MAX 1024
 #define DRM_GET_PROPERTY_BYTE_ARRAY 11
-#define DRM_HAL_LIMIT 4
+#define DRM_HAL_LIMIT 8
 #define DRM_PEND_SLOTS 128
+/* Only ioctls whose write stream is small can carry a getPropertyByteArray
+ * request; the parcel of one is ~116 bytes in total.  Anything bigger is bulk
+ * binder traffic and is dropped without touching user memory. */
+#define DRM_WRITE_MAX 640
+/* How many binder reads after a request are still worth scanning for its reply. */
+#define DRM_WATCH_TTL 256
+#ifndef BINDER_WRITE_READ
+#define BINDER_WRITE_READ _IOWR('b', 1, struct binder_write_read)
+#endif
 
 static const char kDrmDescriptor[] = "android.hardware.drm.IDrmPlugin";
 static const char kDeviceUniqueId[] = "deviceUniqueId";
@@ -87,6 +109,9 @@ struct drm_stats {
 	atomic64_t unknown_br;
 	atomic64_t reply_seen;
 	atomic64_t read_dumps;
+	atomic64_t big_skip;
+	atomic64_t cmd_skip;
+	atomic64_t watch_hits;
 	atomic64_t reported;
 };
 
@@ -105,6 +130,58 @@ static struct drm_call g_call[DRM_PEND_SLOTS];
 static u32 g_hal_tgids[DRM_HAL_LIMIT];
 static u32 g_hal_count;
 static u32 g_hal_enforce;
+/* Auto-learned watch list.  A process enters it when it asks Widevine for
+ * "deviceUniqueId", and stays in it for DRM_WATCH_TTL binder reads - only those
+ * reads are scanned for the reply.  Everything else pays one array lookup. */
+struct drm_watch {
+	u32 tgid;
+	u32 ttl;
+};
+static struct drm_watch g_watch[DRM_HAL_LIMIT];
+static DEFINE_SPINLOCK(g_watch_lock);
+
+static void drm_watch_arm(u32 tgid)
+{
+	unsigned long flags;
+	int i, slot = -1;
+
+	spin_lock_irqsave(&g_watch_lock, flags);
+	for (i = 0; i < DRM_HAL_LIMIT; i++) {
+		if (g_watch[i].tgid == tgid) {
+			slot = i;
+			break;
+		}
+		if (!g_watch[i].tgid && slot < 0)
+			slot = i;
+	}
+	if (slot < 0)
+		slot = 0;
+	g_watch[slot].tgid = tgid;
+	g_watch[slot].ttl = DRM_WATCH_TTL;
+	spin_unlock_irqrestore(&g_watch_lock, flags);
+}
+
+/* Returns true when this tgid is currently watched (and consumes one tick). */
+static bool drm_watch_tick(u32 tgid)
+{
+	unsigned long flags;
+	bool watched = false;
+	int i;
+
+	spin_lock_irqsave(&g_watch_lock, flags);
+	for (i = 0; i < DRM_HAL_LIMIT; i++) {
+		if (g_watch[i].tgid != tgid)
+			continue;
+		watched = true;
+		if (g_watch[i].ttl)
+			g_watch[i].ttl--;
+		else
+			g_watch[i].tgid = 0;
+		break;
+	}
+	spin_unlock_irqrestore(&g_watch_lock, flags);
+	return watched;
+}
 
 /* The value every Widevine client will see once g_replace is turned on. */
 static u8 g_virtual_id[DRM_ID_BYTES];
@@ -430,6 +507,8 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 					return false;
 				if (hdr[0] == 0 && hdr[1] == DRM_ID_BYTES) {
 					candidate = true;
+					/* Another request may follow the same way. */
+					drm_watch_arm(current->tgid);
 					if (READ_ONCE(g_replace)) {
 						u8 __user *dst =
 							(u8 __user *)payload + 8;
@@ -490,31 +569,38 @@ static int drm_pre_handler(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct binder_write_read bwr;
 	struct drm_request_result req = { };
+	unsigned long cmd = regs->regs[1];
 	unsigned long arg = regs->regs[2];
-
+	(void)kp;
+	/* binder_ioctl(filp, cmd, arg).  The command word is a register, so the
+	 * whole system pays one compare here and nothing else. */
+	if ((u32)cmd != (u32)BINDER_WRITE_READ) {
+		atomic64_inc(&g_stats.cmd_skip);
+		return 0;
+	}
 	atomic64_inc(&g_stats.calls);
 	if (!arg)
 		return 0;
 	if (drm_gate_active() && !drm_gate_allows(current->tgid))
 		return 0;
-
 	/* Remember the user pointer: x2 is clobbered long before the function
 	 * returns, so the exit hook cannot read it from regs. */
 	drm_call_store((u64)(uintptr_t)current, current->pid, arg);
-
 	if (copy_from_user(&bwr, (void __user *)arg, sizeof(bwr))) {
 		atomic64_inc(&g_stats.parse_faults);
 		return 0;
 	}
-
 	atomic64_inc(&g_stats.pre_calls);
 	/* write_size / write_buffer are inputs; write_consumed is an output the
 	 * driver fills in, so it is still zero here and must not be tested. */
-	if (bwr.write_size)
-		atomic64_inc(&g_stats.wsz_nonzero);
 	if (!bwr.write_size || !bwr.write_buffer)
 		return 0;
-
+	/* A getPropertyByteArray("deviceUniqueId") request is ~116 bytes in total.
+	 * Anything larger is bulk traffic: drop it without reading user memory. */
+	if (bwr.write_size > DRM_WRITE_MAX) {
+		atomic64_inc(&g_stats.big_skip);
+		return 0;
+	}
 	atomic64_inc(&g_stats.write_streams);
 	drm_scan_write_stream(&bwr, &req);
 
@@ -534,6 +620,9 @@ static int drm_pre_handler(struct kprobe *kp, struct pt_regs *regs)
 				req.descriptor_match ? 1 : 0);
 		drm_pend_store((u64)(uintptr_t)current, current->pid,
 			       req.last_code);
+		/* From now on this process's binder reads are worth scanning: the
+		 * reply to this very request is one of them. */
+		drm_watch_arm(current->tgid);
 	}
 	return 0;
 }
@@ -549,6 +638,13 @@ static void drm_post_handler(struct kprobe *kp, struct pt_regs *regs,
 	(void)regs;
 	if (drm_gate_active() && !drm_gate_allows(current->tgid))
 		return;
+	/* Only a process that just asked for deviceUniqueId is scanned; every
+	 * other reader leaves through here without touching user memory. */
+	if (!drm_watch_tick(current->tgid)) {
+		atomic64_inc(&g_stats.pend_miss);
+		return;
+	}
+	atomic64_inc(&g_stats.watch_hits);
 
 	arg = drm_call_take((u64)(uintptr_t)current, current->pid);
 	if (!arg) {
@@ -616,7 +712,9 @@ static void drm_probe_disarm(void)
 {
 	if (g_drm_kp.symbol_name)
 		unregister_kprobe(&g_drm_kp);
-	g_drm_kp.addr = NULL;
+	/* Same statement as susfs_kp_forget_addr(), the helper the rest of the
+	 * module uses for a probe that was armed once (see susfs_kprobe.h). */
+	susfs_kp_forget_addr(&g_drm_kp);
 }
 
 static int drm_proc_show(struct seq_file *m, void *v)
@@ -634,6 +732,25 @@ static int drm_proc_show(struct seq_file *m, void *v)
 		   g_drm_kp.symbol_name ? g_drm_kp.symbol_name : "off");
 	seq_printf(m, "hal_enforce=%u hal_count=%u\n",
 		   READ_ONCE(g_hal_enforce), READ_ONCE(g_hal_count));
+	{
+		unsigned long flags;
+		int i;
+
+		seq_puts(m, "watch=");
+		spin_lock_irqsave(&g_watch_lock, flags);
+		for (i = 0; i < DRM_HAL_LIMIT; i++) {
+			if (!g_watch[i].tgid)
+				continue;
+			seq_printf(m, "%u/%u ", g_watch[i].tgid,
+				   g_watch[i].ttl);
+		}
+		spin_unlock_irqrestore(&g_watch_lock, flags);
+		seq_puts(m, "\n");
+	}
+	seq_printf(m, "cmd_skip=%lld\n", atomic64_read(&g_stats.cmd_skip));
+	seq_printf(m, "big_skip=%lld\n", atomic64_read(&g_stats.big_skip));
+	seq_printf(m, "watch_hits=%lld\n",
+		   atomic64_read(&g_stats.watch_hits));
 	seq_printf(m, "calls=%lld\n", atomic64_read(&g_stats.calls));
 	seq_printf(m, "pre_calls=%lld\n", atomic64_read(&g_stats.pre_calls));
 	seq_printf(m, "post_calls=%lld\n", atomic64_read(&g_stats.post_calls));
@@ -655,8 +772,6 @@ static int drm_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "pend_store=%lld\n", atomic64_read(&g_stats.pend_store));
 	seq_printf(m, "pend_match=%lld\n", atomic64_read(&g_stats.pend_match));
 	seq_printf(m, "pend_miss=%lld\n", atomic64_read(&g_stats.pend_miss));
-	seq_printf(m, "wsz_nonzero=%lld\n",
-		   atomic64_read(&g_stats.wsz_nonzero));
 	seq_printf(m, "rcons_nonzero=%lld\n",
 		   atomic64_read(&g_stats.rcons_nonzero));
 	seq_printf(m, "arg_miss=%lld\n", atomic64_read(&g_stats.arg_miss));
@@ -753,6 +868,7 @@ int drm_guard_init(void)
 	memset(&g_pend, 0, sizeof(g_pend));
 	memset(g_call, 0, sizeof(g_call));
 	memset(g_hal_tgids, 0, sizeof(g_hal_tgids));
+	memset(g_watch, 0, sizeof(g_watch));
 
 	/* A fresh random identity unless user space installs a fixed one. */
 	get_random_bytes(g_virtual_id, DRM_ID_BYTES);
