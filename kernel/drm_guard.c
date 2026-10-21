@@ -1,22 +1,30 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * drm_guard.c - Widevine "deviceUniqueId" interception, M1 (dry-run).
+ * drm_guard.c - Widevine "deviceUniqueId" interception, M1.3 (dry-run).
  *
- * The recognition rules are carried over verbatim from the SKP device identity
- * module (DRMID 1.4.0):
+ * Recognition rules, carried over from the SKP device identity module (DRMID
+ * 1.4.0 / kernel_context.h + binder_hook_builder.cpp):
  *
- *   request : BC_TRANSACTION whose binder_transaction_data.code == 11
- *             (IDrmPlugin::getPropertyByteArray) and whose parcel carries the
- *             UTF-16 property name "deviceUniqueId"
- *   reply   : BR_REPLY whose reply parcel starts with status == 0 followed by a
- *             byte-array length of exactly 32
- *   scope   : Widevine HAL processes only (tgid whitelist published from
- *             user space, mirroring hal_identity.cpp)
+ *   request : a transaction whose parcel carries "deviceUniqueId"
+ *   reply   : BR_REPLY whose parcel starts with status == 0 and a byte-array
+ *             length of exactly 32
+ *   scope   : tgid whitelist published from user space
  *
- * The hook is a kretprobe on binder_ioctl instead of the SKRoot kernel_module_kit
- * before/after hook, so no kernel text is patched and the matcher is plain C.
- * M1 never modifies a single byte: it only counts and (once per generation)
- * reports a hit to the kernel log.
+ * Where this differs from the original, and why:
+ *
+ *   - The hook is a kprobe on binder_ioctl with a pre/post pair, not the SKRoot
+ *     kernel_module_kit before/after hook, so nothing is written into kernel text.
+ *   - The request MUST be parsed in pre_handler: after binder_ioctl returns,
+ *     libbinder has already freed or recycled the parcel buffer that
+ *     binder_transaction_data.data.ptr.buffer pointed at, so a post-return scan
+ *     reads stale memory and never sees the property name.
+ *   - The request and its reply are normally in DIFFERENT ioctl calls (the client
+ *     receives BR_TRANSACTION_COMPLETE first and blocks for the reply in a later
+ *     call), so a per-thread pending table carries the request across calls - the
+ *     same reason the original keeps a pending ring.
+ *
+ * M1.3 is still observation only: counters plus a bounded amount of logging, the
+ * 32 bytes are never modified.
  */
 #define pr_fmt(fmt) "drm_guard: " fmt
 
@@ -27,7 +35,6 @@
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/mutex.h>
 #include <linux/atomic.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -36,52 +43,57 @@
 #include "drm_guard.h"
 
 #define DRM_ID_BYTES 32
-/* Bounded prefix scan, same idea as the original 256-byte parcel prefix with a
- * wider window: a DRM property parcel is small, we never walk a megabyte. */
 #define DRM_SCAN_BYTES 4096
 #define DRM_CHUNK_BYTES 256
 #define DRM_OVERLAP_BYTES 48
-#define DRM_GET_PROPERTY_BYTE_ARRAY 11
-/* Only parcels this small are worth walking for the property name; anything
- * bigger is a payload transaction, not a property lookup. */
 #define DRM_PARCEL_MAX 1024
+#define DRM_GET_PROPERTY_BYTE_ARRAY 11
 #define DRM_HAL_LIMIT 4
+#define DRM_PEND_SLOTS 128
 
 static const char kDrmDescriptor[] = "android.hardware.drm.IDrmPlugin";
 static const char kDeviceUniqueId[] = "deviceUniqueId";
 
-struct drm_call_ctx {
-	unsigned long arg;
-	unsigned int cmd;
-	unsigned int reserved;
+/* One request waiting for its reply, keyed by the binder thread that issued it. */
+struct drm_pend {
+	u64 task;
+	u32 tid;
+	u32 code;
+	u64 stamp;
+	bool armed;
 };
 
 struct drm_stats {
 	atomic64_t calls;
+	atomic64_t pre_calls;
+	atomic64_t post_calls;
 	atomic64_t write_streams;
 	atomic64_t read_streams;
 	atomic64_t parse_faults;
-	atomic64_t descriptor_hits;
+	atomic64_t code_hits;
 	atomic64_t property_hits;
+	atomic64_t descriptor_hits;
 	atomic64_t drmish_hits;
-	atomic64_t request_hits;
 	atomic64_t reply_candidates;
 	atomic64_t would_replace;
+	atomic64_t pend_store;
+	atomic64_t pend_match;
+	atomic64_t pend_miss;
 	atomic64_t reported;
 };
 
 static struct drm_stats g_stats;
+static struct drm_pend g_pend[DRM_PEND_SLOTS];
 static u32 g_hal_tgids[DRM_HAL_LIMIT];
 static u32 g_hal_count;
-/* 0 = observe every process (M1 default while no HAL whitelist is published). */
 static u32 g_hal_enforce;
 
-static bool drm_hal_gate_active(void)
+static bool drm_gate_active(void)
 {
 	return READ_ONCE(g_hal_enforce) != 0 && READ_ONCE(g_hal_count) != 0;
 }
 
-static bool drm_hal_allowed(u32 tgid)
+static bool drm_gate_allows(u32 tgid)
 {
 	u32 count = READ_ONCE(g_hal_count);
 	u32 i;
@@ -95,8 +107,40 @@ static bool drm_hal_allowed(u32 tgid)
 	return false;
 }
 
-/* Byte search over a kernel buffer, both UTF-16LE (Parcel::writeString16) and
- * raw UTF-8 (the NDK String framing the original also has a fallback for). */
+static u32 drm_pend_index(u64 task)
+{
+	u64 h = (task >> 6) ^ (task >> 17) ^ (task >> 29);
+
+	return (u32)h & (DRM_PEND_SLOTS - 1);
+}
+
+static void drm_pend_store(u64 task, u32 tid, u32 code)
+{
+	struct drm_pend *slot = &g_pend[drm_pend_index(task)];
+
+	WRITE_ONCE(slot->armed, false);
+	slot->task = task;
+	slot->tid = tid;
+	slot->code = code;
+	slot->stamp = local_clock();
+	WRITE_ONCE(slot->armed, true);
+	atomic64_inc(&g_stats.pend_store);
+}
+
+/* Consume the pending request of this thread.  A miss is the normal case for the
+ * many binder reads that are not DRM property lookups. */
+static bool drm_pend_take(u64 task, u32 tid, u32 *code)
+{
+	struct drm_pend *slot = &g_pend[drm_pend_index(task)];
+
+	if (!READ_ONCE(slot->armed) || slot->task != task || slot->tid != tid)
+		return false;
+	*code = slot->code;
+	WRITE_ONCE(slot->armed, false);
+	atomic64_inc(&g_stats.pend_match);
+	return true;
+}
+
 static bool drm_buf_has_token(const u8 *buf, size_t len, const char *token)
 {
 	size_t tlen = strlen(token);
@@ -126,7 +170,6 @@ static bool drm_buf_has_token(const u8 *buf, size_t len, const char *token)
 	return false;
 }
 
-/* Chunked user-memory scan: a fault is never read as a hit. */
 static bool drm_user_has_token(const void __user *base, size_t size,
 			       const char *token)
 {
@@ -150,21 +193,6 @@ static bool drm_user_has_token(const void __user *base, size_t size,
 	return false;
 }
 
-struct drm_request_result {
-	bool code_match;
-	bool property_match;
-	bool descriptor_match;
-	bool drmish_seen;
-	u32 last_code;
-	u32 last_data_size;
-	u32 drmish_code;
-	u32 drmish_size;
-};
-
-/* Exact size of one write-stream command including its header, or 0 when the
- * opcode is not in the table (the caller resynchronises by one word).  Sizes
- * follow <uapi/linux/android/binder.h>: the payload is word aligned, so the
- * whole record always lands on a 4-byte boundary. */
 static u32 drm_bc_record_size(u32 cmd)
 {
 	switch (cmd) {
@@ -183,7 +211,6 @@ static u32 drm_bc_record_size(u32 cmd)
 	case BC_ACQUIRE:
 	case BC_RELEASE:
 	case BC_DECREFS:
-		return sizeof(u32) + sizeof(u32);
 	case BC_ACQUIRE_RESULT:
 		return sizeof(u32) + sizeof(u32);
 	case BC_ATTEMPT_ACQUIRE:
@@ -202,8 +229,18 @@ static u32 drm_bc_record_size(u32 cmd)
 	}
 }
 
-/* Walk the write stream (BC_* commands) looking for one DRM getPropertyByteArray
- * request carrying "deviceUniqueId". */
+struct drm_request_result {
+	bool code_match;
+	bool property_match;
+	bool descriptor_match;
+	bool drmish_seen;
+	u32 last_code;
+	u32 last_data_size;
+	u32 drmish_code;
+	u32 drmish_size;
+};
+
+/* Valid only from pre_handler: the parcel is freed once the ioctl returns. */
 static void drm_scan_write_stream(struct binder_write_read *bwr,
 				  struct drm_request_result *out)
 {
@@ -229,10 +266,6 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 				return;
 			if (td.code == DRM_GET_PROPERTY_BYTE_ARRAY)
 				out->code_match = true;
-			/* The transaction code is NOT assumed: the parcel is what
-			 * identifies a getPropertyByteArray("deviceUniqueId") call,
-			 * and the observed code is what gets reported, so a wrong
-			 * constant shows up as data instead of as silence. */
 			if (td.data_size >= 8 && td.data_size <= DRM_PARCEL_MAX &&
 			    td.data.ptr.buffer) {
 				const void __user *parcel =
@@ -259,11 +292,8 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 		}
 
 		step = drm_bc_record_size(cmd);
-		/* Unknown opcode: resynchronise by one word instead of giving up
-		 * on the whole stream - one alien record must not hide a DRM
-		 * request that comes after it. */
 		if (!step)
-			step = sizeof(u32);
+			step = sizeof(u32);	/* resynchronise, never give up */
 		if (off + step <= off)
 			return;
 		off += step;
@@ -281,7 +311,7 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 		return false;
 	while (off + sizeof(u32) <= consumed) {
 		u32 cmd;
-		u32 step = 0;
+		u32 step;
 		bool candidate = false;
 		struct binder_transaction_data td;
 
@@ -339,49 +369,35 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 	return false;
 }
 
-static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+/* Entry: the parcel is still alive here, so this is the only place a request can
+ * be recognised. */
+static int drm_pre_handler(struct kprobe *kp, struct pt_regs *regs)
 {
-	struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
-
-	if (drm_hal_gate_active() && !drm_hal_allowed(current->tgid))
-		return 1;
-	ctx->arg = regs->regs[2];
-	ctx->cmd = (unsigned int)regs->regs[1];
-	ctx->reserved = 0;
-	atomic64_inc(&g_stats.calls);
-	return 0;
-}
-
-static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 	struct binder_write_read bwr;
 	struct drm_request_result req = { };
-	bool reply;
+	unsigned long arg = regs->regs[2];
 
-	if (!ctx->arg)
+	atomic64_inc(&g_stats.calls);
+	if (!arg)
 		return 0;
-	if (copy_from_user(&bwr, (void __user *)ctx->arg, sizeof(bwr))) {
+	if (drm_gate_active() && !drm_gate_allows(current->tgid))
+		return 0;
+	if (copy_from_user(&bwr, (void __user *)arg, sizeof(bwr))) {
 		atomic64_inc(&g_stats.parse_faults);
 		return 0;
 	}
 
-	if (bwr.write_size && bwr.write_consumed) {
-		atomic64_inc(&g_stats.write_streams);
-		drm_scan_write_stream(&bwr, &req);
-	}
-	if (!bwr.read_size || !bwr.read_consumed)
+	atomic64_inc(&g_stats.pre_calls);
+	if (!bwr.write_size || !bwr.write_consumed)
 		return 0;
 
-	atomic64_inc(&g_stats.read_streams);
-	reply = drm_scan_read_stream(&bwr);
+	atomic64_inc(&g_stats.write_streams);
+	drm_scan_write_stream(&bwr, &req);
 
 	if (req.code_match)
-		atomic64_inc(&g_stats.request_hits);
-
-	/* Diagnostics: a transaction whose parcel mentions "drm" tells us the
-	 * real transaction code of this HAL, and a "deviceUniqueId" parcel is
-	 * the hit itself. Neither is assumed any more. */
+		atomic64_inc(&g_stats.code_hits);
+	if (req.descriptor_match)
+		atomic64_inc(&g_stats.descriptor_hits);
 	if (req.drmish_seen &&
 	    atomic64_inc_return(&g_stats.drmish_hits) <= 6)
 		pr_info("drm-ish tx tgid=%d code=%u size=%u\n",
@@ -392,32 +408,52 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 				current->tgid, req.last_code,
 				req.last_data_size,
 				req.descriptor_match ? 1 : 0);
-	}
-	if (req.descriptor_match)
-		atomic64_inc(&g_stats.descriptor_hits);
-	if (reply)
-		atomic64_inc(&g_stats.reply_candidates);
-
-	/* Dry-run: observe only. A rewrite needs request and reply in the same
-	 * synchronous ioctl, which is how getPropertyByteArray is issued. */
-	if (!req.property_match || !reply)
-		return 0;
-
-	atomic64_inc(&g_stats.would_replace);
-	if (atomic64_inc_return(&g_stats.reported) <= 3) {
-		pr_info("dry-run hit: tgid=%d pid=%d code=%u descriptor=%d\n",
-			current->tgid, current->pid,
-			DRM_GET_PROPERTY_BYTE_ARRAY,
-			req.descriptor_match ? 1 : 0);
+		drm_pend_store((u64)(uintptr_t)current, current->pid,
+			       req.last_code);
 	}
 	return 0;
 }
 
-static struct kretprobe g_drm_krp = {
-	.entry_handler = drm_entry_handler,
-	.handler = drm_ret_handler,
-	.data_size = sizeof(struct drm_call_ctx),
-	.maxactive = 64,
+/* Return: the reply the kernel just wrote is in the caller's buffer. */
+static void drm_post_handler(struct kprobe *kp, struct pt_regs *regs,
+			     unsigned long flags)
+{
+	struct binder_write_read bwr;
+	unsigned long arg = regs->regs[2];
+	u32 code = 0;
+
+	if (!arg)
+		return;
+	if (drm_gate_active() && !drm_gate_allows(current->tgid))
+		return;
+	if (copy_from_user(&bwr, (void __user *)arg, sizeof(bwr))) {
+		atomic64_inc(&g_stats.parse_faults);
+		return;
+	}
+
+	atomic64_inc(&g_stats.post_calls);
+	if (!bwr.read_size || !bwr.read_consumed)
+		return;
+
+	atomic64_inc(&g_stats.read_streams);
+	if (!drm_scan_read_stream(&bwr))
+		return;
+
+	atomic64_inc(&g_stats.reply_candidates);
+	if (!drm_pend_take((u64)(uintptr_t)current, current->pid, &code)) {
+		atomic64_inc(&g_stats.pend_miss);
+		return;
+	}
+
+	atomic64_inc(&g_stats.would_replace);
+	if (atomic64_inc_return(&g_stats.reported) <= 6)
+		pr_info("WOULD-REPLACE tgid=%d code=%u (dry-run, nothing written)\n",
+			current->tgid, code);
+}
+
+static struct kprobe g_drm_kp = {
+	.pre_handler = drm_pre_handler,
+	.post_handler = drm_post_handler,
 };
 
 static const char *const g_drm_probe_symbols[] = {
@@ -431,14 +467,14 @@ static int drm_probe_arm(void)
 	int ret = -ENOENT;
 
 	for (i = 0; i < ARRAY_SIZE(g_drm_probe_symbols); i++) {
-		g_drm_krp.kp.symbol_name = g_drm_probe_symbols[i];
-		g_drm_krp.kp.addr = NULL;
-		ret = register_kretprobe(&g_drm_krp);
+		g_drm_kp.symbol_name = g_drm_probe_symbols[i];
+		g_drm_kp.addr = NULL;
+		ret = register_kprobe(&g_drm_kp);
 		if (!ret) {
-			pr_info("kretprobe armed on %s\n", g_drm_krp.kp.symbol_name);
+			pr_info("kprobe armed on %s\n", g_drm_kp.symbol_name);
 			return 0;
 		}
-		g_drm_krp.kp.addr = NULL;
+		g_drm_kp.addr = NULL;
 	}
 	pr_warn("no probeable binder entry (%d)\n", ret);
 	return ret;
@@ -446,35 +482,39 @@ static int drm_probe_arm(void)
 
 static void drm_probe_disarm(void)
 {
-	if (g_drm_krp.kp.symbol_name)
-		unregister_kretprobe(&g_drm_krp);
-	g_drm_krp.kp.addr = NULL;
+	if (g_drm_kp.symbol_name)
+		unregister_kprobe(&g_drm_kp);
+	g_drm_kp.addr = NULL;
 }
 
 static int drm_proc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "mode=dry-run\n");
 	seq_printf(m, "probe=%s\n",
-		   g_drm_krp.kp.symbol_name ? g_drm_krp.kp.symbol_name : "off");
+		   g_drm_kp.symbol_name ? g_drm_kp.symbol_name : "off");
 	seq_printf(m, "hal_enforce=%u hal_count=%u\n",
 		   READ_ONCE(g_hal_enforce), READ_ONCE(g_hal_count));
 	seq_printf(m, "calls=%lld\n", atomic64_read(&g_stats.calls));
+	seq_printf(m, "pre_calls=%lld\n", atomic64_read(&g_stats.pre_calls));
+	seq_printf(m, "post_calls=%lld\n", atomic64_read(&g_stats.post_calls));
 	seq_printf(m, "write_streams=%lld\n",
 		   atomic64_read(&g_stats.write_streams));
 	seq_printf(m, "read_streams=%lld\n",
 		   atomic64_read(&g_stats.read_streams));
 	seq_printf(m, "parse_faults=%lld\n",
 		   atomic64_read(&g_stats.parse_faults));
-	seq_printf(m, "request_hits=%lld\n",
-		   atomic64_read(&g_stats.request_hits));
+	seq_printf(m, "code_hits=%lld\n", atomic64_read(&g_stats.code_hits));
 	seq_printf(m, "property_hits=%lld\n",
 		   atomic64_read(&g_stats.property_hits));
-	seq_printf(m, "drmish_hits=%lld\n",
-		   atomic64_read(&g_stats.drmish_hits));
 	seq_printf(m, "descriptor_hits=%lld\n",
 		   atomic64_read(&g_stats.descriptor_hits));
+	seq_printf(m, "drmish_hits=%lld\n",
+		   atomic64_read(&g_stats.drmish_hits));
 	seq_printf(m, "reply_candidates=%lld\n",
 		   atomic64_read(&g_stats.reply_candidates));
+	seq_printf(m, "pend_store=%lld\n", atomic64_read(&g_stats.pend_store));
+	seq_printf(m, "pend_match=%lld\n", atomic64_read(&g_stats.pend_match));
+	seq_printf(m, "pend_miss=%lld\n", atomic64_read(&g_stats.pend_miss));
 	seq_printf(m, "would_replace=%lld\n",
 		   atomic64_read(&g_stats.would_replace));
 	return 0;
@@ -518,7 +558,7 @@ static ssize_t drm_proc_write(struct file *file, const char __user *ubuf,
 			WRITE_ONCE(g_hal_tgids[i], tgid);
 			WRITE_ONCE(g_hal_count, READ_ONCE(g_hal_count) + 1);
 			WRITE_ONCE(g_hal_enforce, 1);
-			pr_info("hal tgid %u published (%u total)\n", tgid, i + 1);
+			pr_info("tgid %u published (%u total)\n", tgid, i + 1);
 			return count;
 		}
 	}
@@ -540,6 +580,7 @@ int drm_guard_init(void)
 	int ret;
 
 	memset(&g_stats, 0, sizeof(g_stats));
+	memset(&g_pend, 0, sizeof(g_pend));
 	memset(g_hal_tgids, 0, sizeof(g_hal_tgids));
 
 	ret = drm_probe_arm();
