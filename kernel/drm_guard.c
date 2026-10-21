@@ -278,7 +278,9 @@ struct drm_request_result {
 static void drm_scan_write_stream(struct binder_write_read *bwr,
 				  struct drm_request_result *out)
 {
-	u32 consumed = READ_ONCE(bwr->write_consumed);
+	/* At ioctl entry write_consumed is still zero (the driver fills it in on
+	 * the way out), so the pending length of the command stream is write_size. */
+	u32 consumed = min_t(u32, READ_ONCE(bwr->write_size), DRM_SCAN_BYTES);
 	const u8 __user *stream = (const u8 __user *)bwr->write_buffer;
 	u32 off = 0;
 
@@ -337,7 +339,8 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 /* Walk the read stream (BR_* commands) looking for the 32-byte reply. */
 static bool drm_scan_read_stream(struct binder_write_read *bwr)
 {
-	u32 consumed = READ_ONCE(bwr->read_consumed);
+	/* Valid at exit: the driver has already written the reply stream. */
+	u32 consumed = min_t(u32, READ_ONCE(bwr->read_consumed), DRM_SCAN_BYTES);
 	const u8 __user *stream = (const u8 __user *)bwr->read_buffer;
 	u32 off = 0;
 
