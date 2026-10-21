@@ -420,7 +420,7 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 			    td.data.ptr.buffer) {
 				const void __user *parcel =
 					(const void __user *)td.data.ptr.buffer;
-				u32 size = td.data_size;
+				u32 size = (u32)td.data_size;
 
 				if (drm_user_has_token(parcel, size,
 						       kDeviceUniqueId)) {
@@ -494,7 +494,7 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 			if (cmd == BR_REPLY &&
 			    atomic64_inc_return(&g_stats.reply_seen) <= 6)
 				pr_info("BR_REPLY tgid=%d data_size=%u\n",
-					current->tgid, td.data_size);
+					current->tgid, (u32)td.data_size);
 			if (cmd == BR_REPLY &&
 			    td.data_size >= DRM_ID_BYTES + 8 &&
 			    td.data_size <= DRM_ID_BYTES + 8 + 32 &&
