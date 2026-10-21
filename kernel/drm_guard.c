@@ -59,7 +59,6 @@ struct drm_pend {
 	u64 task;
 	u32 tid;
 	u32 code;
-	u64 stamp;
 	bool armed;
 };
 
@@ -122,7 +121,6 @@ static void drm_pend_store(u64 task, u32 tid, u32 code)
 	slot->task = task;
 	slot->tid = tid;
 	slot->code = code;
-	slot->stamp = local_clock();
 	WRITE_ONCE(slot->armed, true);
 	atomic64_inc(&g_stats.pend_store);
 }
