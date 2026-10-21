@@ -84,6 +84,9 @@ struct drm_stats {
 	atomic64_t arg_miss;
 	atomic64_t replaced;
 	atomic64_t first_hit;
+	atomic64_t unknown_br;
+	atomic64_t reply_seen;
+	atomic64_t read_dumps;
 	atomic64_t reported;
 };
 
@@ -383,6 +386,16 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 
 	if (!stream)
 		return false;
+
+	/* Diagnostics: what does a populated read stream actually look like? */
+	if (consumed && atomic64_inc_return(&g_stats.read_dumps) <= 3) {
+		u8 head[48];
+		u32 n = min_t(u32, consumed, sizeof(head));
+
+		if (!copy_from_user(head, stream, n))
+			pr_info("read stream %u bytes: %*phN\n", consumed, n,
+				head);
+	}
 	while (off + sizeof(u32) <= consumed) {
 		u32 cmd;
 		u32 step;
@@ -401,6 +414,10 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 					   sizeof(td)))
 				return false;
 			step = sizeof(u32) + sizeof(td);
+			if (cmd == BR_REPLY &&
+			    atomic64_inc_return(&g_stats.reply_seen) <= 6)
+				pr_info("BR_REPLY tgid=%d data_size=%u\n",
+					current->tgid, td.data_size);
 			if (cmd == BR_REPLY &&
 			    td.data_size >= DRM_ID_BYTES + 8 &&
 			    td.data_size <= DRM_ID_BYTES + 8 + 32 &&
@@ -451,7 +468,12 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 			step = sizeof(u32);
 			break;
 		default:
-			return false;
+			/* Newer BR codes we do not model: skip the word and keep
+			 * walking instead of abandoning the whole stream. */
+			if (atomic64_inc_return(&g_stats.unknown_br) <= 8)
+				pr_info("unknown BR 0x%x at off=%u\n", cmd, off);
+			step = sizeof(u32);
+			break;
 		}
 		if (candidate)
 			return true;
@@ -639,6 +661,8 @@ static int drm_proc_show(struct seq_file *m, void *v)
 		   atomic64_read(&g_stats.rcons_nonzero));
 	seq_printf(m, "arg_miss=%lld\n", atomic64_read(&g_stats.arg_miss));
 	seq_printf(m, "replaced=%lld\n", atomic64_read(&g_stats.replaced));
+	seq_printf(m, "reply_seen=%lld\n", atomic64_read(&g_stats.reply_seen));
+	seq_printf(m, "unknown_br=%lld\n", atomic64_read(&g_stats.unknown_br));
 	seq_printf(m, "would_replace=%lld\n",
 		   atomic64_read(&g_stats.would_replace));
 	return 0;
