@@ -112,6 +112,8 @@ struct drm_stats {
 	atomic64_t big_skip;
 	atomic64_t cmd_skip;
 	atomic64_t watch_hits;
+	atomic64_t rsize_nonzero;
+	atomic64_t diag;
 	atomic64_t reported;
 };
 
@@ -658,6 +660,13 @@ static void drm_post_handler(struct kprobe *kp, struct pt_regs *regs,
 	}
 
 	atomic64_inc(&g_stats.post_calls);
+	if (bwr.read_size)
+		atomic64_inc(&g_stats.rsize_nonzero);
+	if (atomic64_inc_return(&g_stats.diag) <= 12)
+		pr_info("watch tgid=%d tid=%d ws=%u wc=%u rs=%u rc=%u\n",
+			current->tgid, current->pid,
+			(u32)bwr.write_size, (u32)bwr.write_consumed,
+			(u32)bwr.read_size, (u32)bwr.read_consumed);
 	if (bwr.read_consumed)
 		atomic64_inc(&g_stats.rcons_nonzero);
 	if (!bwr.read_size || !bwr.read_consumed)
