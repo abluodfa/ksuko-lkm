@@ -42,6 +42,9 @@
 #define DRM_CHUNK_BYTES 256
 #define DRM_OVERLAP_BYTES 48
 #define DRM_GET_PROPERTY_BYTE_ARRAY 11
+/* Only parcels this small are worth walking for the property name; anything
+ * bigger is a payload transaction, not a property lookup. */
+#define DRM_PARCEL_MAX 1024
 #define DRM_HAL_LIMIT 4
 
 static const char kDrmDescriptor[] = "android.hardware.drm.IDrmPlugin";
@@ -60,6 +63,7 @@ struct drm_stats {
 	atomic64_t parse_faults;
 	atomic64_t descriptor_hits;
 	atomic64_t property_hits;
+	atomic64_t drmish_hits;
 	atomic64_t request_hits;
 	atomic64_t reply_candidates;
 	atomic64_t would_replace;
@@ -150,8 +154,11 @@ struct drm_request_result {
 	bool code_match;
 	bool property_match;
 	bool descriptor_match;
-	u32 data_size_log;
+	bool drmish_seen;
+	u32 last_code;
 	u32 last_data_size;
+	u32 drmish_code;
+	u32 drmish_size;
 };
 
 /* Exact size of one write-stream command including its header, or 0 when the
@@ -220,21 +227,33 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 			if (copy_from_user(&td, stream + off + sizeof(u32),
 					   sizeof(td)))
 				return;
-			if (td.code == DRM_GET_PROPERTY_BYTE_ARRAY &&
-			    td.data_size >= 8 && td.data.ptr.buffer) {
+			if (td.code == DRM_GET_PROPERTY_BYTE_ARRAY)
+				out->code_match = true;
+			/* The transaction code is NOT assumed: the parcel is what
+			 * identifies a getPropertyByteArray("deviceUniqueId") call,
+			 * and the observed code is what gets reported, so a wrong
+			 * constant shows up as data instead of as silence. */
+			if (td.data_size >= 8 && td.data_size <= DRM_PARCEL_MAX &&
+			    td.data.ptr.buffer) {
 				const void __user *parcel =
 					(const void __user *)td.data.ptr.buffer;
+				u32 size = td.data_size;
 
-				out->code_match = true;
-				if (drm_user_has_token(parcel, td.data_size,
-						       kDeviceUniqueId))
+				if (drm_user_has_token(parcel, size,
+						       kDeviceUniqueId)) {
 					out->property_match = true;
-				if (drm_user_has_token(parcel, td.data_size,
-						       kDrmDescriptor))
-					out->descriptor_match = true;
-				if (out->code_match && out->data_size_log < 4) {
-					out->data_size_log++;
-					out->last_data_size = td.data_size;
+					out->last_code = td.code;
+					out->last_data_size = size;
+					if (drm_user_has_token(parcel, size,
+							       kDrmDescriptor))
+						out->descriptor_match = true;
+					return;
+				}
+				if (!out->drmish_seen &&
+				    drm_user_has_token(parcel, size, "drm")) {
+					out->drmish_seen = true;
+					out->drmish_code = td.code;
+					out->drmish_size = size;
 				}
 			}
 		}
@@ -357,17 +376,23 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	atomic64_inc(&g_stats.read_streams);
 	reply = drm_scan_read_stream(&bwr);
 
-	if (req.code_match) {
-		/* Diagnostics: the first few code==11 requests, whatever interface
-		 * they belong to, so a wrong assumption is visible in dmesg. */
-		if (atomic64_inc_return(&g_stats.request_hits) <= 6)
-			pr_info("code11 tgid=%d data_size=%u desc=%d prop=%d\n",
-				current->tgid, req.last_data_size,
-				req.descriptor_match ? 1 : 0,
-				req.property_match ? 1 : 0);
+	if (req.code_match)
+		atomic64_inc(&g_stats.request_hits);
+
+	/* Diagnostics: a transaction whose parcel mentions "drm" tells us the
+	 * real transaction code of this HAL, and a "deviceUniqueId" parcel is
+	 * the hit itself. Neither is assumed any more. */
+	if (req.drmish_seen &&
+	    atomic64_inc_return(&g_stats.drmish_hits) <= 6)
+		pr_info("drm-ish tx tgid=%d code=%u size=%u\n",
+			current->tgid, req.drmish_code, req.drmish_size);
+	if (req.property_match) {
+		if (atomic64_inc_return(&g_stats.property_hits) <= 6)
+			pr_info("PROPERTY HIT tgid=%d code=%u size=%u desc=%d\n",
+				current->tgid, req.last_code,
+				req.last_data_size,
+				req.descriptor_match ? 1 : 0);
 	}
-	if (req.property_match)
-		atomic64_inc(&g_stats.property_hits);
 	if (req.descriptor_match)
 		atomic64_inc(&g_stats.descriptor_hits);
 	if (reply)
@@ -444,6 +469,8 @@ static int drm_proc_show(struct seq_file *m, void *v)
 		   atomic64_read(&g_stats.request_hits));
 	seq_printf(m, "property_hits=%lld\n",
 		   atomic64_read(&g_stats.property_hits));
+	seq_printf(m, "drmish_hits=%lld\n",
+		   atomic64_read(&g_stats.drmish_hits));
 	seq_printf(m, "descriptor_hits=%lld\n",
 		   atomic64_read(&g_stats.descriptor_hits));
 	seq_printf(m, "reply_candidates=%lld\n",
