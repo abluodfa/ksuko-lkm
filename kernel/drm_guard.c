@@ -78,11 +78,24 @@ struct drm_stats {
 	atomic64_t pend_store;
 	atomic64_t pend_match;
 	atomic64_t pend_miss;
+	atomic64_t wsz_nonzero;
+	atomic64_t rcons_nonzero;
+	atomic64_t arg_miss;
 	atomic64_t reported;
+};
+
+/* Argument registers are scratch by the time the probed function returns, so the
+ * entry hook stashes the ioctl's user pointer here for the exit hook to use. */
+struct drm_call {
+	u64 task;
+	u32 tid;
+	bool armed;
+	unsigned long arg;
 };
 
 static struct drm_stats g_stats;
 static struct drm_pend g_pend[DRM_PEND_SLOTS];
+static struct drm_call g_call[DRM_PEND_SLOTS];
 static u32 g_hal_tgids[DRM_HAL_LIMIT];
 static u32 g_hal_count;
 static u32 g_hal_enforce;
@@ -137,6 +150,29 @@ static bool drm_pend_take(u64 task, u32 tid, u32 *code)
 	WRITE_ONCE(slot->armed, false);
 	atomic64_inc(&g_stats.pend_match);
 	return true;
+}
+
+static void drm_call_store(u64 task, u32 tid, unsigned long arg)
+{
+	struct drm_call *slot = &g_call[drm_pend_index(task)];
+
+	WRITE_ONCE(slot->armed, false);
+	slot->task = task;
+	slot->tid = tid;
+	slot->arg = arg;
+	WRITE_ONCE(slot->armed, true);
+}
+
+static unsigned long drm_call_take(u64 task, u32 tid)
+{
+	struct drm_call *slot = &g_call[drm_pend_index(task)];
+	unsigned long arg;
+
+	if (!READ_ONCE(slot->armed) || slot->task != task || slot->tid != tid)
+		return 0;
+	arg = slot->arg;
+	WRITE_ONCE(slot->armed, false);
+	return arg;
 }
 
 static bool drm_buf_has_token(const u8 *buf, size_t len, const char *token)
@@ -380,13 +416,22 @@ static int drm_pre_handler(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	if (drm_gate_active() && !drm_gate_allows(current->tgid))
 		return 0;
+
+	/* Remember the user pointer: x2 is clobbered long before the function
+	 * returns, so the exit hook cannot read it from regs. */
+	drm_call_store((u64)(uintptr_t)current, current->pid, arg);
+
 	if (copy_from_user(&bwr, (void __user *)arg, sizeof(bwr))) {
 		atomic64_inc(&g_stats.parse_faults);
 		return 0;
 	}
 
 	atomic64_inc(&g_stats.pre_calls);
-	if (!bwr.write_size || !bwr.write_consumed)
+	/* write_size / write_buffer are inputs; write_consumed is an output the
+	 * driver fills in, so it is still zero here and must not be tested. */
+	if (bwr.write_size)
+		atomic64_inc(&g_stats.wsz_nonzero);
+	if (!bwr.write_size || !bwr.write_buffer)
 		return 0;
 
 	atomic64_inc(&g_stats.write_streams);
@@ -417,19 +462,28 @@ static void drm_post_handler(struct kprobe *kp, struct pt_regs *regs,
 			     unsigned long flags)
 {
 	struct binder_write_read bwr;
-	unsigned long arg = regs->regs[2];
+	unsigned long arg;
 	u32 code = 0;
 
-	if (!arg)
-		return;
+	(void)kp;
+	(void)regs;
 	if (drm_gate_active() && !drm_gate_allows(current->tgid))
 		return;
+
+	arg = drm_call_take((u64)(uintptr_t)current, current->pid);
+	if (!arg) {
+		atomic64_inc(&g_stats.arg_miss);
+		return;
+	}
+
 	if (copy_from_user(&bwr, (void __user *)arg, sizeof(bwr))) {
 		atomic64_inc(&g_stats.parse_faults);
 		return;
 	}
 
 	atomic64_inc(&g_stats.post_calls);
+	if (bwr.read_consumed)
+		atomic64_inc(&g_stats.rcons_nonzero);
 	if (!bwr.read_size || !bwr.read_consumed)
 		return;
 
@@ -513,6 +567,11 @@ static int drm_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "pend_store=%lld\n", atomic64_read(&g_stats.pend_store));
 	seq_printf(m, "pend_match=%lld\n", atomic64_read(&g_stats.pend_match));
 	seq_printf(m, "pend_miss=%lld\n", atomic64_read(&g_stats.pend_miss));
+	seq_printf(m, "wsz_nonzero=%lld\n",
+		   atomic64_read(&g_stats.wsz_nonzero));
+	seq_printf(m, "rcons_nonzero=%lld\n",
+		   atomic64_read(&g_stats.rcons_nonzero));
+	seq_printf(m, "arg_miss=%lld\n", atomic64_read(&g_stats.arg_miss));
 	seq_printf(m, "would_replace=%lld\n",
 		   atomic64_read(&g_stats.would_replace));
 	return 0;
@@ -579,6 +638,7 @@ int drm_guard_init(void)
 
 	memset(&g_stats, 0, sizeof(g_stats));
 	memset(&g_pend, 0, sizeof(g_pend));
+	memset(g_call, 0, sizeof(g_call));
 	memset(g_hal_tgids, 0, sizeof(g_hal_tgids));
 
 	ret = drm_probe_arm();
