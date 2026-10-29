@@ -51,6 +51,12 @@ static bool avc_registered;
 static atomic_t avc_hit_count = ATOMIC_INIT(0);
 static atomic_t avc_enter_count = ATOMIC_INIT(0);
 
+/* [v16.56][P0] 同步自 ksuko-lkm：ssid 与 tsid 都要改写。
+ * 旧实现只改 tsid，而 root 检测器 grep 的是 su 域"造成"的那批记录 ——
+ * "avc: denied ... scontext=u:r:ksu:s0"，那里 su sid 是 SOURCE(ssid)，
+ * 只改 tsid 等于一条都没盖住。现在两端都判、都改。
+ * 寄存器布局：6.4+ 去掉了 selinux_state* 首参，ssid=regs[0]/tsid=regs[1]；
+ * 6.3- 有首参，ssid=regs[1]/tsid=regs[2]。 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 #define AVC_SSID_REG	0
 #define AVC_TSID_REG	1
@@ -65,15 +71,12 @@ static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 
 	atomic_inc(&avc_enter_count);
 
-	/* Either sid unresolved means no spoofing at all: a 0 must not match (it is a real sid
-	 * value here), and writing 0 over a real one makes security_sid_to_context() fail, so
-	 * audit prints "scontext=???" - louder than the domain name being hidden. */
+	/* 任一 sid 未解析成功就整体不动作：0 不能当匹配（它是合法 sid 值），
+	 * 而把真实 sid 写成 0 会让 security_sid_to_context() 失败，
+	 * audit 打出 "scontext=???" —— 比暴露域名更显眼。 */
 	if (!avc_su_sid || !avc_priv_app_sid)
 		return 0;
 
-	/* BOTH ends.  The records a root detector greps for are the ones the su domain CAUSES -
-	 * "avc: denied ... scontext=u:r:ksu:s0" - and there the su sid is the SOURCE; rewriting
-	 * tsid alone left every one of those lines intact. */
 	if ((u32)regs->regs[AVC_SSID_REG] == avc_su_sid) {
 		regs->regs[AVC_SSID_REG] = avc_priv_app_sid;
 		hit = true;
@@ -122,8 +125,9 @@ static int avc_register(void)
 		mutex_unlock(&avc_ctl_lock);
 		return 0;
 	}
-	/* The handler would bail out on every call, so report it here instead of arming a probe
-	 * that can never spoof anything. */
+	/* [v16.56][P0] 同步自 ksuko-lkm：sid 没解析成功时 handler 每次都会直接 return，
+	 * 挂上去等于挂了个空探针。这里提前拒绝并说明原因，而不是假装成功。
+	 * 影响：/proc/susfs_avc_spoof 写 1 在 sid 解析失败时返回 -EOPNOTSUPP 并打 warn。 */
 	if (!avc_su_sid || !avc_priv_app_sid) {
 		mutex_unlock(&avc_ctl_lock);
 		pr_warn("avc_spoof: su_sid=%u priv_app_sid=%u - both contexts must resolve against this device's policy (override with avc_su_ctx=/avc_priv_app_ctx=)\n",
