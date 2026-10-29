@@ -139,6 +139,8 @@ static bool susfs_btf_matches(u32 id, const char *wanted)
                    !!(BTF_INT_ENCODING(encoding) & BTF_INT_SIGNED) ==
                        !strcmp(base, "int");
         }
+        if (kind == BTF_KIND_INT)
+            return name && !strcmp(name, base);
         return kind == BTF_KIND_STRUCT && name && !strcmp(name, base);
     }
     return false;
