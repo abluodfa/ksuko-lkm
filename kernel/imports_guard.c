@@ -138,9 +138,10 @@ static const struct susfs_import susfs_imports[] = {
     IMP(__put_cred),
     IMP(strnlen_user),
     IMP(___ratelimit),
-    /* copy_to_user()'s check_object_size() is an empty inline without this option, so the
-     * out-of-line helper is neither referenced nor present, and listing it unconditionally
-     * makes this guard the unresolved symbol it exists to catch. */
+    /* [v16.56][P0] 同步自 ksuko-lkm：__check_object_size 只在 CONFIG_HARDENED_USERCOPY=y 的内核里
+     * 被 copy_to_user() 真正引用并导出；未开该配置时它是空 inline，符号根本不存在。
+     * 无条件列出会让本 guard 自己变成"未解析符号"，ksud insmod 直接 -EINVAL 拒绝加载。
+     * 影响：未开 HARDENED_USERCOPY 的内核现在也能加载本 ko；开了的内核行为不变。 */
 #ifdef CONFIG_HARDENED_USERCOPY
     IMP(__check_object_size),
 #endif
