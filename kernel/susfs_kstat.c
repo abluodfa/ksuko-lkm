@@ -1643,16 +1643,20 @@ static susfs_syscall_fn_t kstat_orig_compat_getdents;
 									\
 		if (!orig)						\
 			return -ENOSYS;					\
+		/* Module-text guard, see susfs_fp_enter(). */		\
+		if (!susfs_fp_enter())					\
+			return orig(regs);				\
 		/* susfs_syscall_fn_t takes a const regs (the table's own type) while	\
-		 * syscall_get_arguments() asks for a non-const one it only reads - the	\
-		 * cast is what that difference costs, and nothing here writes regs. */	\
-		syscall_get_arguments(current, (struct pt_regs *)regs, a);	\
+		 * syscall_get_arguments() asks for a non-const one it only reads -	\
+		 * the cast is what that difference costs, and nothing here writes	\
+		 * regs. */						\
+		syscall_get_arguments(current, (struct pt_regs *)regs, a);\
 		ret = orig(regs);					\
 		out = ret;						\
 		susfs_kstat_post(nrval, combat, a, ret, &out);		\
+		susfs_fp_leave();					\
 		return out;						\
 	}
-
 SUSFS_KSTAT_WRAPPER(kstat_wrap_nfstatat, kstat_orig_nfstatat, __NR_newfstatat, false)
 SUSFS_KSTAT_WRAPPER(kstat_wrap_fstat, kstat_orig_fstat, __NR_fstat, false)
 SUSFS_KSTAT_WRAPPER(kstat_wrap_statx, kstat_orig_statx, __NR_statx, false)
@@ -1669,12 +1673,18 @@ static __nocfi long kstat_wrap_getdents64(const struct pt_regs *regs)
 
 	if (!orig)
 		return -ENOSYS;
-	if (susfs_dirent_prefilter(regs, &out, false))
+	/* Module-text guard, see susfs_fp_enter(). */
+	if (!susfs_fp_enter())
+		return orig(regs);
+	if (susfs_dirent_prefilter(regs, &out, false)) {
+		susfs_fp_leave();
 		return out;
+	}
 	syscall_get_arguments(current, (struct pt_regs *)regs, a);
 	ret = orig(regs);
 	out = ret;
 	susfs_kstat_post(__NR_getdents64, false, a, ret, &out);
+	susfs_fp_leave();
 	return out;
 }
 SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_stat64, kstat_orig_compat_stat64, COMPAT_STAT64_NR, true)
@@ -1693,12 +1703,18 @@ static __nocfi long kstat_wrap_compat_getdents64(const struct pt_regs *regs)
 
 	if (!orig)
 		return -ENOSYS;
-	if (susfs_dirent_prefilter(regs, &out, false))
+	/* Module-text guard, see susfs_fp_enter(). */
+	if (!susfs_fp_enter())
+		return orig(regs);
+	if (susfs_dirent_prefilter(regs, &out, false)) {
+		susfs_fp_leave();
 		return out;
+	}
 	syscall_get_arguments(current, (struct pt_regs *)regs, a);
 	ret = orig(regs);
 	out = ret;
 	susfs_kstat_post(SUS_NR_GETDENTS64_COMPAT, true, a, ret, &out);
+	susfs_fp_leave();
 	return out;
 }
 
@@ -1710,12 +1726,18 @@ static __nocfi long kstat_wrap_compat_getdents(const struct pt_regs *regs)
 
 	if (!orig)
 		return -ENOSYS;
-	if (susfs_dirent_prefilter(regs, &out, true))
+	/* Module-text guard, see susfs_fp_enter(). */
+	if (!susfs_fp_enter())
+		return orig(regs);
+	if (susfs_dirent_prefilter(regs, &out, true)) {
+		susfs_fp_leave();
 		return out;
+	}
 	syscall_get_arguments(current, (struct pt_regs *)regs, a);
 	ret = orig(regs);
 	out = ret;
 	susfs_kstat_post(SUS_NR_GETDENTS_COMPAT, true, a, ret, &out);
+	susfs_fp_leave();
 	return out;
 }
 
