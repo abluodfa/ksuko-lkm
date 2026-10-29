@@ -13,8 +13,6 @@
 #include <linux/security.h>	/* security_secctx_to_secid(): the nodes' SELinux label */
 
 #include "symbol_resolver.h"
-#include "drm_guard.h"		/* Widevine deviceUniqueId dry-run probe */
-#include "taint_spoof.h"	/* get_taint -> 0, what the shipped ko also does */
 #include "ksu_allow_gate.h"	/* susfs_ksu_allow_kind: whether ksu_file applies at all */
 #include "patch_memory.h"	/* ksu_patch_memory_init(): the flush helper's name differs per kernel */
 #include "susfs_log.h"
@@ -24,6 +22,8 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
+#include "drm_guard.h"		/* Widevine deviceUniqueId 改写（binder 层） */
+#include "taint_spoof.h"	/* /proc/sys/kernel/tainted 按 uid 伪装 */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
  * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
@@ -59,6 +59,17 @@ static const char *const susfs_self_hide_paths[] = {
     /* The O_PATH layer's node: it reports the four sys_call_table/compat_sys_call_table
      * entries and the counters that say whether a wrapper ever ran. */
     SUSFS_OPATH_NODE,
+    /* taint_spoof's counters: spoofed/passthru 只给 root 看，非 root 读必须 ENOENT，
+     * 否则「有个节点在统计 taint 读取」本身就是模块存在的证据。 */
+    "/proc/susfs_taint",
+    /* drm_guard's state: 名字和内容一起漏。实测 su 10357 能直接 cat 出
+     * mode/enabled/armed/probe/uids/haluid，比 tainted 更直接地暴露模块存在。
+     * 只靠 0644 不够——进了这张表 mode 会被放宽成 0777，所以 drm_proc_open /
+     * drm_proc_write 里也加了 susfs_control_visible()。 */
+    "/proc/susfs_drm_guard",
+    /* hitlog 的内容是 0600，但「/proc 里有个 susfs_hitlog」这个事实本身就是证据。
+     * 同理补上门槛检查后再收进来。 */
+    "/proc/susfs_hitlog",
     /* The module's own sysfs directory is NOT here: it belongs to hide_module
      * (susfs_hide_syms.c), which adds and drops that rule at runtime. */
 };
@@ -272,14 +283,6 @@ static struct {
     { "avc_spoof",	susfs_avc_spoof_init,		susfs_avc_spoof_exit,	false, false },
     { "supercall",	susfs_supercall_init,		susfs_supercall_exit,	true,  false },
     { "hide_syms",	susfs_hide_syms_init,		susfs_hide_syms_exit,	false, false },
-    /* Observation only (M1): a kretprobe on binder_ioctl that counts DRM
-     * getPropertyByteArray("deviceUniqueId") round trips and writes no byte.
-     * NOT fatal: on a kernel whose binder entry cannot be probed the module
-     * still loads, this feature simply stays off. */
-    { "drm_guard",	drm_guard_init,			drm_guard_exit,		false, false },
-    /* Restores what the shipped HideGuard ko does and upstream does not:
-     * get_taint() reports 0, so /proc/sys/kernel/tainted stays clean. */
-    { "taint_spoof",	susfs_taint_spoof_init,		susfs_taint_spoof_exit,	false, false },
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
@@ -360,6 +363,14 @@ static int __init susfs_init(void)
 
     /* Registered last and undone implicitly: these are entries in sus_path's table, which
      * sus_path_exit() empties while its LSM layer still answers ENOENT for the nodes. */
+    /* drm_guard：Widevine deviceUniqueId 改写（binder 层） */
+    if (drm_guard_init())
+        pr_warn("susfs_guard_lkm: drm_guard init failed - DRM spoof stays off\n");
+    /* taint_spoof：/proc/sys/kernel/tainted 按 uid 伪装。顺序有要求：
+     * 在 drm_guard_init() 之后（白名单由它持有），在 susfs_self_hide_nodes()
+     * 之前（节点必须先存在，kern_path() 才能解析并加进隐藏表）。 */
+    if (susfs_taint_spoof_init(susfs_control_node_allowed()))
+        pr_warn("susfs_guard_lkm: taint_spoof init failed - taint stays visible\n");
     susfs_self_hide_nodes();
     susfs_relabel_control_nodes();
 
@@ -380,6 +391,10 @@ static int __init susfs_init(void)
 
 static void __exit susfs_exit(void)
 {
+    /* 先卸 taint_spoof：它的 handler 会读 drm_guard 的白名单，虽然 g_uids 是
+     * 静态数组不会释放，但先摘掉 probe 可以保证退出过程中没有新的调用进来。 */
+    susfs_taint_spoof_exit();
+    drm_guard_exit();
     susfs_layers_down((int)ARRAY_SIZE(susfs_layers) - 1);
     SUSFS_LOGI("susfs_guard_lkm: exit\n");
 }
