@@ -37,6 +37,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/namei.h>
+#include <linux/dcache.h>	/* dget_parent()/d_find_alias(): contents 的父链判定 */
 #include <linux/fs.h>
 #include <linux/err.h>
 #include <linux/errno.h>
@@ -44,6 +45,7 @@
 #include <linux/workqueue.h>	/* the pending-resolution retry timer */
 #include <linux/mutex.h>	/* serialises the first rule's arming */
 #include <linux/limits.h>
+#include <linux/timekeeping.h>	/* ktime_get_real_seconds() for the hit log */
 #include <linux/cred.h>
 #include <linux/atomic.h>
 #include <linux/wait.h>
@@ -136,6 +138,11 @@ struct sus_path_entry {
  * (which runs inside sus_path_lock) and from both add paths, so declare them first. */
 static int sus_path_iop_arm(struct sus_path_entry *e);
 static void sus_path_iop_restore(struct sus_path_entry *e);
+/* contents（目录保留、内容为空）的父链判定：实现在文件后半段，LSM 钩子在前面就要用。 */
+static bool sus_path_contents_ancestor_hidden(const struct dentry *dentry, bool include_self,
+                                              char *path_out, size_t path_len);
+static bool sus_path_contents_alias_hidden(struct inode *inode, char *path_out, size_t path_len);
+bool sus_path_dirent_dir_hidden(struct inode *dir_inode);
 /* Counted when the i_op copy could not be allocated: the readlink face then stays as it
  * was (a registered plain file answers EINVAL where stat answers ENOENT) instead of
  * failing the registration - the rule still hides everything the other faces cover. */
@@ -431,12 +438,64 @@ static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already report
 static int hide_from_apps = 1;
 module_param(hide_from_apps, int, 0644);
 
+/* Per-app filter (hideguard/device_hide integration): when this string is non-empty, a
+ * process is only treated as a hiding candidate when its uid appears in this comma/space
+ * separated list.  Empty (default) keeps the upstream behaviour: every KernelSU-umounted
+ * app is hidden.  It is a live parameter, so it can be changed without reloading:
+ *   echo 10336 > /sys/module/susfs_guard_lkm/parameters/target_uids
+ * This reproduces the "only these apps must see the path as absent" rule that the vendor
+ * (device_hide) module expressed through its own target_uids insmod parameter. */
+/* [v16.78][P0] 512B 太小：MODE=global 时 74 个应用（5 位 uid + 逗号）已占 444B，
+ * 应用数继续增长会被 module_param_string 静默截断（末位 uid 变成半个数字，
+ * 匹配到错误 uid 或漏掉应用，且无任何报错）。4096B 可容纳约 680 个应用。 */
+static char target_uids_buf[4096] = "";
+module_param_string(target_uids, target_uids_buf, sizeof(target_uids_buf), 0644);
+
+/* True when the calling process' uid is allowed to be hidden.  An empty list means
+ * "no restriction" (return true), which makes this a pure opt-in narrowing. */
+static bool sus_target_uid_match(void)
+{
+    const char *p = target_uids_buf;
+    uid_t cur = current_uid().val;
+    bool any_digit = false;
+
+    if (!p)
+        return true;
+    /* sysfs 写入总是带着尾部换行，而 param_set_copystring() 并不会去掉它：MODE=global 时
+     * 用户态写进去的是 "\n"，旧逻辑把它当成「非空、但一个 uid 都没有的列表」，于是每一次
+     * 比较都不匹配 -> 全局拦截完全失效（表现为命中计数一动不动）。
+     * 这里做两件事：跳过前导空白；把「整串没有任何数字」视为未限制（等价于空列表）。 */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    if (!*p)
+        return true;
+    while (*p) {
+        unsigned long v = 0;
+        bool any = false;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (unsigned long)(*p - '0');
+            any = true;
+            any_digit = true;
+            p++;
+        }
+        if (any && (uid_t)v == cur)
+            return true;
+        while (*p && (*p < '0' || *p > '9'))
+            p++;
+    }
+    if (!any_digit)
+        return true;
+    return false;
+}
+
 /* UID half of the upstream gate: a PENDING rule has no inode to ask about ownership
  * (sus_path_entry_gate_any()). */
 static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
         return true;
+    if (!sus_target_uid_match())
+        return false;
     return susfs_is_current_proc_umounted_app();
 }
 
@@ -448,6 +507,8 @@ static inline bool sus_path_gate_ok(struct inode *inode)
 {
     if (!hide_from_apps)
         return true;
+    if (!sus_target_uid_match())
+        return false;
     if (!susfs_is_current_proc_umounted_app())
         return false;
     return current_uid().val != inode->i_uid.val;
@@ -1098,6 +1159,179 @@ static struct ksu_lsm_hook sus_path_getattr_hook =
 static struct ksu_lsm_hook sus_path_perm_hook =
 	KSU_LSM_HOOK_INSERT(inode_permission, (void *)sus_path_inode_permission);
 
+/* ---- per-uid / per-path hit accounting (hideguard module UI) ----
+ * The upstream sus_path layer only keeps global enoent counters.  The hideguard
+ * control UI needs to show WHICH app was blocked on WHICH registered path and how
+ * many times, so a small table is kept here: one slot per (uid, path) pair, plus
+ * one global total.  A slot is never overwritten once used; when the table is
+ * full further pairs only bump the global total (the detail view is a diagnostic,
+ * not an audit log).  Slots start empty and survive until unload.
+ */
+#define SUS_HIT_SLOTS 64
+struct sus_hit_slot {
+    bool used;
+    u32 uid;
+    u64 cnt;
+    u64 last_ts;
+    char path[SUS_PATH_LEN];
+};
+static struct sus_hit_slot sus_hit_tab[SUS_HIT_SLOTS];
+static DEFINE_SPINLOCK(sus_hit_lock);
+static atomic64_t sus_hit_total = ATOMIC64_INIT(0);
+
+/* Ring of the most recent hits, so the UI can list WHEN a rule fired.
+ * 256 entries * 16 bytes; the oldest entry is overwritten first.  The slot
+ * index points into sus_hit_tab (slots are never recycled), which keeps the
+ * per-event record small and lets the reader recover uid+path from the table. */
+#define SUS_HIT_EVENTS 256
+struct sus_hit_evt {
+    u64 ts;
+    u32 slot;
+};
+static struct sus_hit_evt sus_hit_evt[SUS_HIT_EVENTS];
+static u32 sus_hit_evt_pos;
+
+static void sus_hit_record(const char *path)
+{
+    unsigned long flags;
+    u32 uid = (u32)current_uid().val;
+    u64 now = ktime_get_real_seconds();
+    int i, slot = -1;
+
+    if (!path || !path[0])
+        return;
+    spin_lock_irqsave(&sus_hit_lock, flags);
+    for (i = 0; i < SUS_HIT_SLOTS; i++) {
+        if (sus_hit_tab[i].used && sus_hit_tab[i].uid == uid &&
+            !strcmp(sus_hit_tab[i].path, path)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (i = 0; i < SUS_HIT_SLOTS; i++) {
+            if (!sus_hit_tab[i].used) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot >= 0) {
+        if (!sus_hit_tab[slot].used) {
+            sus_hit_tab[slot].used = true;
+            sus_hit_tab[slot].uid = uid;
+            sus_hit_tab[slot].cnt = 0;
+            strscpy(sus_hit_tab[slot].path, path, SUS_PATH_LEN);
+        }
+        sus_hit_tab[slot].cnt++;
+        sus_hit_tab[slot].last_ts = now;
+        {
+            unsigned int ep = sus_hit_evt_pos % SUS_HIT_EVENTS;
+            sus_hit_evt[ep].ts = now;
+            sus_hit_evt[ep].slot = (u32)slot;
+            sus_hit_evt_pos++;
+        }
+    }
+    atomic64_inc(&sus_hit_total);
+    spin_unlock_irqrestore(&sus_hit_lock, flags);
+}
+
+/* /proc/susfs_hitlog: TOTAL <n> followed by one HIT line per (uid, path) pair.
+ * TAB separated, matching the hideguard webui parser:
+ *   TOTAL<TAB><total>
+ *   HIT<TAB><uid><TAB><count><TAB><last_ts><TAB><path>
+ * 0600: root only, so it is not part of the hidden control surface.
+ */
+static int sus_hitlog_show(struct seq_file *m, void *v)
+{
+    unsigned long flags;
+    int i;
+
+    seq_printf(m, "TOTAL\t%llu\n", (unsigned long long)atomic64_read(&sus_hit_total));
+    for (i = 0; i < SUS_HIT_SLOTS; i++) {
+        char pbuf[SUS_PATH_LEN];
+        u32 uid;
+        u64 cnt, ts;
+        bool used;
+
+        spin_lock_irqsave(&sus_hit_lock, flags);
+        used = sus_hit_tab[i].used;
+        uid = sus_hit_tab[i].uid;
+        cnt = sus_hit_tab[i].cnt;
+        ts = sus_hit_tab[i].last_ts;
+        if (used)
+            memcpy(pbuf, sus_hit_tab[i].path, SUS_PATH_LEN);
+        spin_unlock_irqrestore(&sus_hit_lock, flags);
+        pbuf[SUS_PATH_LEN - 1] = 0;
+        if (used)
+            seq_printf(m, "HIT\t%u\t%llu\t%llu\t%s\n", uid,
+                       (unsigned long long)cnt, (unsigned long long)ts, pbuf);
+    }
+    {
+        unsigned int n = sus_hit_evt_pos < SUS_HIT_EVENTS ? sus_hit_evt_pos : SUS_HIT_EVENTS;
+        unsigned int start = sus_hit_evt_pos - n;
+        unsigned int ei;
+
+        for (ei = 0; ei < n; ei++) {
+            unsigned int ep = (start + ei) % SUS_HIT_EVENTS;
+            u32 slot = READ_ONCE(sus_hit_evt[ep].slot);
+            u64 ets = READ_ONCE(sus_hit_evt[ep].ts);
+
+            if (slot < SUS_HIT_SLOTS && READ_ONCE(sus_hit_tab[slot].used))
+                seq_printf(m, "EVT\t%u\t%llu\t%s\n", sus_hit_tab[slot].uid,
+                           (unsigned long long)ets, sus_hit_tab[slot].path);
+        }
+    }
+    return 0;
+}
+
+static int sus_hitlog_open(struct inode *inode, struct file *file)
+{
+    /* 0600 拦不住 relax_mode：进了 self_hide_paths 之后 inode mode 会被放宽成
+     * 0777，所以门槛必须自己答。ENOENT 而不是 EACCES，理由同 sus_path_proc_open。 */
+    if (!susfs_control_visible())
+        return -ENOENT;
+    return single_open(file, sus_hitlog_show, NULL);
+}
+
+/* Writing anything to /proc/susfs_hitlog resets the accounting in place.
+ * The counters live in module memory, so a plain write zeroes them; this is what
+ * lets the hideguard UI clear the log instantly instead of doing rmmod+insmod
+ * (measured ~2.5s rmmod + ~0.9s insmod, with the rule table empty in between).
+ * The clear runs under sus_hit_lock so a concurrent sus_hit_record() cannot
+ * resurrect a slot mid-clear.
+ */
+static ssize_t sus_hitlog_write(struct file *file, const char __user *ubuf,
+                                size_t count, loff_t *ppos)
+{
+    unsigned long flags;
+    int i;
+
+    /* Same reason as the open check: an fd opened before the process dropped
+     * privileges must not become a way in. */
+    if (!susfs_control_visible())
+        return -ENOENT;
+    spin_lock_irqsave(&sus_hit_lock, flags);
+    for (i = 0; i < SUS_HIT_SLOTS; i++) {
+        sus_hit_tab[i].used = false;
+        sus_hit_tab[i].cnt = 0;
+        sus_hit_tab[i].last_ts = 0;
+    }
+    WRITE_ONCE(sus_hit_evt_pos, 0);
+    atomic64_set(&sus_hit_total, 0);
+    spin_unlock_irqrestore(&sus_hit_lock, flags);
+    return (ssize_t)count;
+}
+
+static const struct proc_ops sus_hitlog_proc_ops = {
+    .proc_open = sus_hitlog_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+    .proc_write = sus_hitlog_write,
+};
+static struct proc_dir_entry *sus_hitlog_node_entry;
+
 static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
 static atomic_t n_enoent_perm = ATOMIC_INIT(0);
 
@@ -1152,8 +1386,11 @@ static atomic_t n_identity_hits = ATOMIC_INIT(0);
 static bool sus_path_inode_hidden(struct inode *inode)
 {
     struct sus_path_entry *e;
-    bool hidden = false, by_identity = false;
+    bool hidden = false, by_identity = false, have_hit = false;
+    char hit_path[SUS_PATH_LEN];
     u64 dev;
+
+    hit_path[0] = 0;
 
     if (!inode || !READ_ONCE(sus_path_count))
         return false;
@@ -1197,10 +1434,17 @@ static bool sus_path_inode_hidden(struct inode *inode)
             }
         }
     }
+    if (hidden && e && !e->self_protect) {
+        strscpy(hit_path, e->path, SUS_PATH_LEN);
+        have_hit = true;
+    }
     spin_unlock(&sus_path_lock);
 
     if (by_identity)
         atomic_inc(&n_identity_hits);
+
+    if (have_hit)
+        sus_hit_record(hit_path);
 
     return hidden;
 }
@@ -1222,10 +1466,19 @@ bool sus_path_inode_hidden_public(struct inode *inode)
 static int sus_path_inode_getattr(const struct path *path)
 {
     struct inode *inode;
-
     if (path && path->dentry) {
+        char hit_path[SUS_PATH_LEN];
+
         inode = d_inode(path->dentry);
         if (sus_path_inode_hidden(inode)) {
+            atomic_inc(&n_enoent_getattr);
+            return -ENOENT;
+        }
+        /* 父链命中：这里在进程上下文，可以安全写 hitlog。 */
+        if (sus_path_contents_ancestor_hidden(path->dentry, false,
+                                              hit_path, sizeof(hit_path))) {
+            if (hit_path[0])
+                sus_hit_record(hit_path);
             atomic_inc(&n_enoent_getattr);
             return -ENOENT;
         }
@@ -1240,7 +1493,19 @@ static int sus_path_inode_getattr(const struct path *path)
 
 static int sus_path_inode_permission(struct inode *inode, int mask)
 {
+    char hit_path[SUS_PATH_LEN];
+
     if (sus_path_inode_hidden(inode)) {
+        atomic_inc(&n_enoent_perm);
+        return -ENOENT;
+    }
+    /* contents 的父链判定：本钩子只拿到 inode，没有 dentry，所以借一个别名 dentry 往上走。
+     * 只在这一层没有规则命中时才做（没有 contents 规则的机器上完全不进这段），
+     * 于是"已枚举的子项"走的还是原来那条一次比较的快路径。
+     * 这里在进程上下文，父链命中可以安全写 hitlog。 */
+    if (sus_path_contents_alias_hidden(inode, hit_path, sizeof(hit_path))) {
+        if (hit_path[0])
+            sus_hit_record(hit_path);
         atomic_inc(&n_enoent_perm);
         return -ENOENT;
     }
@@ -1261,11 +1526,15 @@ static atomic_t n_enoent_nameop = ATOMIC_INIT(0);
 static bool sus_path_dentry_hidden(const struct dentry *dentry)
 {
     struct inode *inode;
-
     if (!dentry)
         return false;
     inode = d_inode(dentry);
-    return inode && sus_path_inode_hidden(inode);
+    if (inode && sus_path_inode_hidden(inode))
+        return true;
+    /* 表里没有的子项（addc 之后新建的）由父链判定兜住，这样 create/unlink/rename
+     * 与 stat 看到的是同一个答案。这里不写 hitlog：本钩子可能处在原子上下文，
+     * 记录由 inode_getattr / inode_permission 在进程上下文完成。 */
+    return sus_path_contents_ancestor_hidden(dentry, false, NULL, 0);
 }
 
 /* ---- readlink: the one face gated on i_op ----
@@ -1978,23 +2247,29 @@ static long sus_path_filter(unsigned long buf, long count,
  * size_t underflow (about 2^64), scnprintf believes it has unlimited room, and read(2) hands
  * the caller whatever followed the page in the heap.  About 50 ordinary rules are enough. */
 #define SUS_PATH_LIST_SLACK 400		/* longest line below (two names, 2x20 digits) */
-static int sus_path_list_puts(char *buf, int n, bool *trunc, const char *fmt, ...)
+/* [v16.77][P0] /proc/susfs_path 的读取缓冲。旧实现固定 PAGE_SIZE(4096)：
+ *   derived 子项一多（实测 49 条 path 行 ≈ 5.8KB）就被截断，尾部只追加一行
+ *   "(truncated: ...)"。service.sh 的 missing() 和 webui.sh 的 drift 检测都只
+ *   看到前 4096 字节，于是把「内核里有、只是没打印出来」的规则误判成缺失，
+ *   面板永远报「未生效」。这里放大到 64KB，并让 format_list 用真实 size 做边界。 */
+#define SUS_PATH_PROC_BUF (64 * 1024)
+static int sus_path_list_puts(char *buf, int n, size_t size, bool *trunc, const char *fmt, ...)
 {
     va_list args;
     int room, written;
 
-    if (n < 0 || n >= (int)PAGE_SIZE - 1) {
+    if (n < 0 || n >= (int)size - 1) {
         *trunc = true;
         return n;
     }
-    room = (int)PAGE_SIZE - n;
+    room = (int)size - n;
     va_start(args, fmt);
     written = vsnprintf(buf + n, room, fmt, args);
     va_end(args);
     if (written >= room) {
         /* vsnprintf reports what it WOULD have written; room-1 + terminator fit. */
         *trunc = true;
-        return (int)PAGE_SIZE - 1;
+        return (int)size - 1;
     }
     return n + written;
 }
@@ -2053,6 +2328,332 @@ static bool sus_path_path_is_ours(const char *path)
     return ours;
 }
 
+/* =====================================================================
+ * hideguard · contents-only（目录保留、内容为空）
+ * 与 SUSFS4SKP 0.3.11 的 directory_search 可观测行为一致。
+ * 目录本身永不入表 → 永远可见；直接子项用 sus_path_add_hidden()
+ * 登记 → add/del 全按现有 inode 精确匹配。
+ * ===================================================================== */
+struct sus_path_contents {
+    struct list_head list;
+    char path[SUS_PATH_LEN];
+    unsigned int derived;
+    unsigned int failed;
+    /* 目录自身的身份。父链判定需要它（(dev, ino) 精确匹配 + ihold 的 inode 快比较）；
+     * 持有引用意味着目录即使被 rmdir，编号也不会被内核回收复用，规则不会误命中别的目录。 */
+    struct inode *inode;
+    u64 dev;
+    u64 ino;
+};
+static LIST_HEAD(sus_path_contents_list);
+static unsigned int sus_path_contents_count;
+static unsigned int sus_path_contents_derived;
+static unsigned int sus_path_contents_failed;
+
+#define SUS_CONTENTS_SCAN_MAX 512
+struct sus_contents_scan {
+    struct dir_context ctx;
+    struct sus_path_contents *c;
+    char *names;            /* count * SUS_PATH_LEN，第一遍只收名字 */
+    unsigned int cap;
+    unsigned int count;
+    unsigned int overflow;
+};
+/* 第一遍：只把 d_name 抄下来，绝不在 READDIR 回调里做 lookup。
+ * FUSE（/storage/emulated/0）上如果边收边 kern_path()，子项解析会失败，
+ * 表现为 "N child rule(s), 1 failed" —— 就是 /Documents 里漏掉的那一条。 */
+static bool sus_contents_scan_actor(struct dir_context *ctx, const char *name, int namlen,
+                                    loff_t off, u64 ino, unsigned int d_type)
+{
+    struct sus_contents_scan *s = container_of(ctx, struct sus_contents_scan, ctx);
+    char *slot;
+
+    if (namlen <= 0 || namlen >= SUS_PATH_LEN || !strcmp(name, ".") || !strcmp(name, ".."))
+        return true;
+    if (!s->names)
+        return true;
+    if (s->count >= s->cap) {
+        s->overflow++;
+        return true;
+    }
+    slot = s->names + (size_t)s->count * SUS_PATH_LEN;
+    memcpy(slot, name, namlen);
+    slot[namlen] = '\0';
+    s->count++;
+    return true;
+}
+
+static int sus_path_scan_contents(struct sus_path_contents *c, bool adding, int *removed_out)
+{
+    struct sus_contents_scan s = {
+        .ctx.actor = sus_contents_scan_actor,
+        .c = c,
+        .cap = SUS_CONTENTS_SCAN_MAX,
+    };
+    struct file *f;
+    unsigned int i;
+    int rc;
+
+    c->derived = 0;
+    c->failed  = 0;
+    if (removed_out)
+        *removed_out = 0;
+
+    s.names = kvmalloc_array((size_t)SUS_CONTENTS_SCAN_MAX, SUS_PATH_LEN, GFP_KERNEL);
+    if (!s.names)
+        return -ENOMEM;
+
+    f = filp_open(c->path, O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(f)) {
+        kvfree(s.names);
+        return (int)PTR_ERR(f);
+    }
+
+    rc = iterate_dir(f, &s.ctx);        /* 第一遍：收名字 */
+    filp_close(f, NULL);
+    if (rc) {
+        kvfree(s.names);
+        return rc;
+    }
+
+    /* 第二遍：READDIR 已经结束，这时才做 lookup / 登记。 */
+    for (i = 0; i < s.count; i++) {
+        const char *name = s.names + (size_t)i * SUS_PATH_LEN;
+        char child[SUS_PATH_LEN];
+
+        if (snprintf(child, sizeof(child), "%s/%s", c->path, name) >= (int)sizeof(child)) {
+            c->failed++;
+            continue;
+        }
+        if (adding) {
+            int arc = sus_path_add_hidden(child);
+            if (!arc) {
+                c->derived++;
+            } else {
+                c->failed++;
+                SUSFS_LOGI("sus_path: contents child %s failed rc=%d\n", child, arc);
+            }
+        } else if (sus_path_del_path(child) > 0) {
+            if (removed_out)
+                (*removed_out)++;
+        }
+    }
+    if (s.overflow) {
+        c->failed += s.overflow;
+        SUSFS_LOGI("sus_path: contents %s capped at %u entries, %u not scanned\n",
+                   c->path, s.cap, s.overflow);
+    }
+
+    if (adding) {
+        sus_path_contents_derived += c->derived;
+        sus_path_contents_failed  += c->failed;
+    }
+    kvfree(s.names);
+    return 0;
+}
+
+/* addc <dir>：目录保留，只藏直接子项 */
+static int sus_path_add_contents(const char *path)
+{
+    struct sus_path_contents *c, *n;
+    struct path p;
+    struct inode *dinode;
+    u64 dev, ino;
+    int rc;
+
+    list_for_each_entry_safe(c, n, &sus_path_contents_list, list) {
+        if (!strcmp(c->path, path))
+            return 0;
+    }
+
+    if (kern_path(path, LOOKUP_FOLLOW, &p))
+        return -ENOENT;
+    dinode = d_inode(p.dentry);
+    if (!dinode || !S_ISDIR(dinode->i_mode)) {
+        path_put(&p);
+        return -ENOTDIR;
+    }
+    dev = (u64)dinode->i_sb->s_dev;
+    ino = (u64)dinode->i_ino;
+    ihold(dinode);
+    path_put(&p);
+
+    c = kzalloc(sizeof(*c), GFP_KERNEL);
+    if (!c) {
+        iput(dinode);
+        return -ENOMEM;
+    }
+    strscpy(c->path, path, sizeof(c->path));
+    c->inode = dinode;
+    c->dev = dev;
+    c->ino = ino;
+
+    rc = sus_path_scan_contents(c, true, NULL);
+    if (rc) {
+        iput(dinode);
+        kfree(c);
+        return rc;
+    }
+
+    list_add_tail(&c->list, &sus_path_contents_list);
+    sus_path_contents_count++;
+
+    SUSFS_LOGI("sus_path: contents %s, %u child rule(s), %u failed, %u dir(s)\n",
+               c->path, c->derived, c->failed, sus_path_contents_count);
+    return 0;
+}
+
+/* delc <dir>：重扫一遍撤回子项，再丢目录条目 */
+static int sus_path_del_contents(const char *path)
+{
+    struct sus_path_contents *c, *n;
+
+    list_for_each_entry_safe(c, n, &sus_path_contents_list, list) {
+        int removed = 0;
+
+        if (strcmp(c->path, path))
+            continue;
+
+        sus_path_scan_contents(c, false, &removed);
+
+        list_del(&c->list);
+        sus_path_contents_count--;
+        iput(c->inode);
+        kfree(c);
+
+        SUSFS_LOGI("sus_path: contents %s removed, %d child rule(s) dropped\n",
+                   path, removed);
+        return 0;
+    }
+    return -ENOENT;
+}
+
+static void sus_path_contents_clear(void)
+{
+    struct sus_path_contents *c, *n;
+
+    list_for_each_entry_safe(c, n, &sus_path_contents_list, list) {
+        list_del(&c->list);
+        iput(c->inode);
+        kfree(c);
+    }
+    sus_path_contents_count = 0;
+    sus_path_contents_derived = 0;
+    sus_path_contents_failed = 0;
+}
+
+static void sus_path_contents_release(void)
+{
+    sus_path_contents_clear();
+}
+/* ---- 父链判定（第二套判定面，用于 addc 之后新建的内容）---------------------------
+ * 枚举出来的子项仍然入表，那条快路径一次比较就命中，本函数不会被执行到；只有表里没有的
+ * 对象（目录里新建的名字、老 inode 被换掉的文件）才靠这里兜住，于是"目录在、内容为空"
+ * 不再依赖 addc 那一刻的目录快照，与 SUSFS4SKP 0.3.11 的 directory_search 判定面一致。
+ * 判定从 dentry 的父链往上走，命中任意一层 contents 规则即隐藏；规则目录自身永远可见
+ * （include_self=false，同时它本来也不入表）。
+ */
+static bool sus_path_contents_match_inode(const struct inode *inode,
+                                          char *path_out, size_t path_len)
+{
+    struct sus_path_contents *c;
+    bool hit = false;
+    u64 dev, ino;
+    if (!inode)
+        return false;
+    dev = (u64)inode->i_sb->s_dev;
+    ino = (u64)inode->i_ino;
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(c, &sus_path_contents_list, list) {
+        if (c->inode == (struct inode *)inode ||
+            (c->ino && c->ino == ino && c->dev == dev)) {
+            hit = true;
+            /* 命中时把规则目录的路径带出去：父链判定没有"被访问对象"的路径字符串，
+             * hitlog 记规则目录本身才是对的（用户看到的是"哪个规则拦的"）。 */
+            if (path_out && path_len)
+                strscpy(path_out, c->path, path_len);
+            break;
+        }
+    }
+    spin_unlock(&sus_path_lock);
+    return hit;
+}
+/* 深度上限：Android 真实路径远小于此值，设它是为了病态深度（或 d_parent 自环）不把
+ * 每次 stat 拖成无界循环。SUSFS4SKP 那边用的是 4096。 */
+#define SUS_CONTENTS_ANCESTOR_MAX 64
+static bool sus_path_contents_ancestor_hidden(const struct dentry *dentry, bool include_self,
+                                              char *path_out, size_t path_len)
+{
+    struct dentry *d, *parent;
+    bool hidden = false;
+    int depth = 0;
+
+    if (path_out && path_len)
+        path_out[0] = 0;
+    if (!dentry || !READ_ONCE(sus_path_contents_count))
+        return false;
+    /* 自己正在解析某条路径时，父链判定必须闭嘴，否则规则目录里的 pending 解析会被自己拒绝。 */
+    if (sus_path_is_resolver())
+        return false;
+    /* contents 是"目录级"规则，按 uid 门控即可：这里没有单一"被访问的 inode"可以用来
+     * 做 upstream 那条 ownership 比较，而目录里的东西本来就该整体隐藏。 */
+    if (!sus_path_gate_uid_ok())
+        return false;
+    d = dget((struct dentry *)dentry);
+    while (d) {
+        struct inode *inode = d_inode(d);
+        if (inode && (include_self || d != (struct dentry *)dentry) &&
+            sus_path_contents_match_inode(inode, path_out, path_len)) {
+            hidden = true;
+            break;
+        }
+        if (++depth >= SUS_CONTENTS_ANCESTOR_MAX)
+            break;
+        parent = dget_parent(d);
+        if (parent == d) {              /* 到根了 */
+            dput(parent);
+            break;
+        }
+        dput(d);
+        d = parent;
+    }
+    if (d)
+        dput(d);
+    /* 这里只判定、不写 hitlog：本函数会被 dentry_hidden 调用，而那条链可能处在
+     * inode_unlink/rmdir/rename 的原子上下文里。记录交给调用方在进程上下文做。 */
+    return hidden;
+}
+/* inode_permission 只拿到 inode：借一个别名 dentry 走父链判定。
+ * 没有 contents 规则时一次 READ_ONCE 就返回，热路径不受影响。 */
+static bool sus_path_contents_alias_hidden(struct inode *inode, char *path_out, size_t path_len)
+{
+    struct dentry *alias;
+    bool hidden;
+    if (path_out && path_len)
+        path_out[0] = 0;
+    if (!inode || !READ_ONCE(sus_path_contents_count))
+        return false;
+    alias = d_find_alias(inode);
+    if (!alias)
+        return false;
+    hidden = sus_path_contents_ancestor_hidden(alias, false, path_out, path_len);
+    dput(alias);
+    return hidden;
+}
+/* readdir 面：被列的目录本身就是 contents 规则时，除 "." 和 ".." 之外一律不输出。
+ * 走 sus_dirent.c 的 prefilter 那条路时手里有目录的 struct file，所以传进来的是
+ * (i_sb->s_dev, i_ino)，跨文件系统不会误命中 —— 这也是新建内容不需要等重扫的原因。 */
+bool sus_path_dirent_dir_hidden(struct inode *dir_inode)
+{
+    if (!dir_inode || !READ_ONCE(sus_path_contents_count))
+        return false;
+    if (sus_path_is_resolver())
+        return false;
+    if (!sus_path_gate_uid_ok())
+        return false;
+    return sus_path_contents_match_inode(dir_inode, NULL, 0);
+}
+
 static int sus_path_command(const char *val, int *removed_out)
 {
     char cmd[SUS_PATH_LEN + 16];
@@ -2067,6 +2668,33 @@ static int sus_path_command(const char *val, int *removed_out)
     if (!strcmp(cmd, "clear")) {
         while (removed < SUS_PATH_MAX_ENTRIES && sus_path_release_one(NULL, NULL, true))
             removed++;
+        sus_path_contents_clear();          /* contents 规则一并清掉 */
+    } else if (!strncmp(cmd, "addc ", 5) || !strncmp(cmd, "delc ", 5)) {
+        bool adding = (cmd[0] == 'a');
+
+        arg = cmd + 5;
+        while (*arg == ' ')
+            arg++;
+        if (!*arg)
+            return -EINVAL;
+        {
+            size_t alen = strlen(arg);
+
+            while (alen > 1 && arg[alen - 1] == '/')
+                ((char *)arg)[--alen] = '\0';
+        }
+        if (!adding && sus_path_path_is_ours(arg))
+            return -EPERM;
+        if (adding) {
+            int rc = sus_path_add_contents(arg);
+
+            if (rc)
+                return rc;
+        } else if (sus_path_del_contents(arg)) {
+            return -ENOENT;
+        }
+        SUSFS_LOGI("sus_path: %s %s, %u dir(s) left\n",
+                adding ? "addc" : "delc", arg, sus_path_contents_count);
     } else if (!strncmp(cmd, "add ", 4) || !strncmp(cmd, "del ", 4)) {
         bool adding = (cmd[0] == 'a');
 
@@ -2195,7 +2823,7 @@ static int sus_path_format_list(char *buf, size_t size)
     bool trunc = false;
     int n = 0;
 
-    n = sus_path_list_puts(buf, n, &trunc,
+    n = sus_path_list_puts(buf, n, size, &trunc,
                    "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d meta=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
@@ -2203,27 +2831,51 @@ static int sus_path_format_list(char *buf, size_t size)
     /* The readlink face works by pointing a registered inode at a copy of its i_op whose
      * readlink slot is ours (see sus_path_inode_readlink), so what matters here is how
      * often that slot answers, and whether every copy could be allocated. */
-    n = sus_path_list_puts(buf, n, &trunc,
+    n = sus_path_list_puts(buf, n, size, &trunc,
                    "readlink: enoent=%d armfail=%d\n",
                    atomic_read(&n_enoent_readlink), atomic_read(&n_iop_arm_fail));
-    n = sus_path_list_puts(buf, n, &trunc,
+    n = sus_path_list_puts(buf, n, size, &trunc,
                    "dirent: pending=%d (counters: /proc/susfs_kstat)\n",
                    atomic_read(&sus_path_n_pending));
+    /* contents-only（目录保留、内容为空）：这些目录本身不入表，只把子项登记进来。 */
+    if (sus_path_contents_count || sus_path_contents_derived || sus_path_contents_failed) {
+        struct sus_path_contents *c;
+
+        n = sus_path_list_puts(buf, n, size, &trunc,
+                       "contents: %u dir(s), derived=%u, failed=%u, mode=directory_search\n",
+                       sus_path_contents_count, sus_path_contents_derived,
+                       sus_path_contents_failed);
+        /* 每个规则目录单独一行（contents=<path>）。config.conf 里写的是目录，而内核表里
+         * 只有子项；没有这一行，webui.sh 的配置漂移检测会把「目录 vs 子项」当成不一致，
+         * 永远报「缺 N 条 / 多 M 条」。汇总行用冒号，这里用等号，两者不会混淆。 */
+        spin_lock(&sus_path_lock);
+        list_for_each_entry(c, &sus_path_contents_list, list) {
+            /* [v16.78][P0] contents 与 path 各占一半预算：旧实现两者共用 size，
+             * contents 规则多时会把缓冲吃光，path 一条都输出不了，脚本侧
+             * grep '^path=' 得到空 -> missing() 判全部缺失 -> 反复全量重跑。 */
+            if (n > (int)(size / 2) - SUS_PATH_LIST_SLACK) {
+                trunc = true;
+                break;
+            }
+            n = sus_path_list_puts(buf, n, size, &trunc, "contents=%s\n", c->path);
+        }
+        spin_unlock(&sus_path_lock);
+    }
     if (n_lsm_ext_fail)
-        n = sus_path_list_puts(buf, n, &trunc,
+        n = sus_path_list_puts(buf, n, size, &trunc,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
                        n_lsm_ext_fail, first_lsm_ext_fail);
     /* A normal, expected number rather than an alarm: how often a lookup had to fall through
      * to (dev, ino) because the rule's object was not the one being accessed.  Printed only
      * when non-zero; a steadily growing value is the interesting case. */
     if (atomic_read(&n_identity_hits))
-        n = sus_path_list_puts(buf, n, &trunc,
+        n = sus_path_list_puts(buf, n, size, &trunc,
                        "identity: %d hit(s) where the inode pointer did not match and (dev,ino) or (fs type,ino) answered instead\n",
                        atomic_read(&n_identity_hits));
     /* passes/ticks == 0 means the retry never ran; walks > 0 with pending > 0 means the walk
      * kept failing (last-rc says how); lost > 0 means a walk succeeded with no rule to
      * publish it. */
-    n = sus_path_list_puts(buf, n, &trunc,
+    n = sus_path_list_puts(buf, n, size, &trunc,
                    "pend: passes=%d ticks=%d walks=%d lost=%d last-rc=%d caller-cred=%d\n",
                    atomic_read(&sus_path_pend_passes),
                    atomic_read(&sus_path_pend_ticks),
@@ -2234,11 +2886,11 @@ static int sus_path_format_list(char *buf, size_t size)
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list) {
-        if (n > (int)PAGE_SIZE - SUS_PATH_LIST_SLACK) {
+        if (n > (int)size - SUS_PATH_LIST_SLACK) {
             trunc = true;
             break;
         }
-        n = sus_path_list_puts(buf, n, &trunc,
+        n = sus_path_list_puts(buf, n, size, &trunc,
                        "path=%s  dev=%llu ino=%llu name=%s%s%s\n",
                        e->path[0] ? e->path : "(?)", e->dev, e->ino, e->name,
                        e->self_protect ? "  [ours: clear/del refuse it]" : "",
@@ -2247,10 +2899,16 @@ static int sus_path_format_list(char *buf, size_t size)
     spin_unlock(&sus_path_lock);
 
     if (!sus_path_count)
-        n = sus_path_list_puts(buf, n, &trunc, "(no paths registered)\n");
+        n = sus_path_list_puts(buf, n, size, &trunc, "(no paths registered)\n");
     if (trunc)
-        n = sus_path_list_puts(buf, n, &trunc,
+        n = sus_path_list_puts(buf, n, size, &trunc,
                        "(truncated: the table holds more rules than one page; the rules are intact)\n");
+    /* [v16.78][P1] hide_list 的 get 回调由 kernel/params.c 分配 PAGE_SIZE 缓冲，
+     * 无法像 /proc/susfs_path 那样用 64K，所以这里明确告知调用者视图被截断，
+     * 避免把「只看到一页」误判成「规则只有这么多」。 */
+    if (size < SUS_PATH_PROC_BUF)
+        n = sus_path_list_puts(buf, n, size, &trunc,
+                       "(this view is capped at one page; read /proc/susfs_path for the full table)\n");
     return n < (int)size ? n : (int)size - 1;
 }
 
@@ -2268,12 +2926,12 @@ static struct proc_dir_entry *sus_path_node_entry;
 
 static int sus_path_proc_show(struct seq_file *m, void *v)
 {
-    char *buf = kvmalloc(PAGE_SIZE, GFP_KERNEL);
+    char *buf = kvmalloc(SUS_PATH_PROC_BUF, GFP_KERNEL);
     int n;
 
     if (!buf)
         return -ENOMEM;
-    n = sus_path_format_list(buf, PAGE_SIZE);
+    n = sus_path_format_list(buf, SUS_PATH_PROC_BUF);
     if (n > 0)
         seq_write(m, buf, (size_t)n);
     kvfree(buf);
@@ -2659,6 +3317,9 @@ int sus_path_init(void)
      * layer's own init, so paths resolve. */
     if (susfs_control_node_allowed()) {
         sus_path_node_entry = proc_create("susfs_path", 0777, NULL, &sus_path_proc_ops);
+        sus_hitlog_node_entry = proc_create("susfs_hitlog", 0600, NULL, &sus_hitlog_proc_ops);
+        if (!sus_hitlog_node_entry)
+            pr_warn("sus_path: proc_create(susfs_hitlog) failed\n");
         if (!sus_path_node_entry)
             pr_warn("sus_path: proc_create(susfs_path) failed - the listing stays reachable through the hide_list parameter\n");
     } else {
@@ -2701,6 +3362,10 @@ void sus_path_exit(void)
     if (sus_path_node_entry) {
         proc_remove(sus_path_node_entry);
         sus_path_node_entry = NULL;
+    }
+    if (sus_hitlog_node_entry) {
+        proc_remove(sus_hitlog_node_entry);
+        sus_hitlog_node_entry = NULL;
     }
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries (and their inode
@@ -2750,6 +3415,8 @@ void sus_path_exit(void)
     while (sus_path_release_one(NULL, NULL, false))
         ;
     wait_event(sus_path_release_wait, !sus_path_releases_pending(NULL));
+    /* contents 规则（目录条目）不 hold inode，直接释放链表即可。 */
+    sus_path_contents_release();
     /* Every entry restored its inode's i_op before dropping the reference (see
      * sus_path_iop_restore()), so nothing points at these copies any more; the copies
      * themselves are ours and go with the module. */
