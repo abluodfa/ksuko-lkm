@@ -382,34 +382,47 @@ __nocfi long susfs_opath_post_fd(long ret)
 	static __nocfi long fn(const struct pt_regs *regs)		\
 	{								\
 		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
-		susfs_or_entry_fn_t or_hook = READ_ONCE(susfs_or_entry_hook);	\
+		susfs_or_entry_fn_t or_hook;				\
 		long ret;						\
 									\
 		if (!orig)						\
 			return -ENOSYS;					\
+		/* Module-text guard, see susfs_fp_enter(): a caller that arrives	\
+		 * after the drain has started is handed straight to the original -	\
+		 * the entries are restored by then, so this only covers the race	\
+		 * against the restore itself. */			\
+		if (!susfs_fp_enter())					\
+			return orig(regs);				\
 		atomic_inc(&n_opath_seen);				\
-		/* open_redirect's name layer is asked first, and gets the same five entries: a	\
-		 * syscall entry can have only one wrapper, so it registers a hook instead of	\
-		 * installing its own.  When it redirects, the original syscall is not called at	\
-		 * all - it opens the target itself and returns the fd, and that fd goes through	\
-		 * susfs_opath_post_fd() right here, so an O_PATH answer is judged the same way	\
-		 * whichever of the two produced it (and a negative errno passes straight through	\
-		 * that function, which leaves anything that is not an fd alone). */		\
+		or_hook = READ_ONCE(susfs_or_entry_hook);		\
+		/* open_redirect's name layer is asked first, and gets the same five	\
+		 * entries: a syscall entry can have only one wrapper, so it		\
+		 * registers a hook instead of installing its own.  When it redirects	\
+		 * the original syscall is not called at all - it opens the target	\
+		 * itself and returns the fd, which goes through susfs_opath_post_fd()	\
+		 * right here, so an O_PATH answer is judged the same way whichever of	\
+		 * the two produced it. */				\
 		if (or_hook) {						\
 			ret = or_hook(regs, (kind));			\
 			if (ret != SUSFS_OR_ENTRY_PASS) {		\
 				if ((flags_reg) >= 0 && ret >= 0 &&	\
 				    !(regs->regs[flags_reg] & O_PATH))	\
-					return ret;			\
-				return susfs_opath_post_fd(ret);	\
+					goto out;			\
+				ret = susfs_opath_post_fd(ret);		\
+				goto out;				\
 			}						\
 		}							\
 		ret = orig(regs);					\
-		if ((flags_reg) >= 0 && !(regs->regs[flags_reg] & O_PATH))	\
-			return ret;					\
-		return susfs_opath_post_fd(ret);			\
+		if ((flags_reg) >= 0 && !(regs->regs[flags_reg] & O_PATH))\
+			goto out;					\
+		ret = susfs_opath_post_fd(ret);				\
+	out:								\
+		/* Single exit: the count is dropped on every path, including the	\
+		 * O_PATH post-check, which is the slow one and the one most likely	\
+		 * to still be running when the drain starts. */		\
+		susfs_fp_leave();					\
+		return ret;						\
 	}
-
 static susfs_syscall_fn_t opath_orig_openat;
 static susfs_syscall_fn_t opath_orig_openat2;
 static susfs_syscall_fn_t opath_orig_compat_open;
