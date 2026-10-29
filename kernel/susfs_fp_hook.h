@@ -69,4 +69,31 @@ void susfs_fp_dump_entry(int nr, const char *sym);
 /* Prints the first instruction of a wrapper - 'bti c' or nothing. */
 void susfs_fp_dump_wrapper(const char *name, const void *fn);
 
+
+/* Entry/exit bracket for every wrapper body.
+ *
+ * susfs_fp_remove() restoring a table entry only stops NEW calls.  It says nothing
+ * about a task that already picked a wrapper out of the table - and such a task
+ * spends nearly all of its time inside orig(regs), i.e. SLEEPING in the filesystem.
+ * Sleeping is a quiescent state for synchronize_rcu_tasks(), so that primitive
+ * cannot see it: the drain returned with a task parked in wrapper code, rmmod freed
+ * the text, and the task came back into it.  Measured on this device as
+ *
+ *     Unable to handle kernel paging request at virtual address 0000000080080d0a
+ *     pc : susfs_opath_openat+0x38/0xb4 [susfs_guard_lkm]
+ *
+ * - the stadd of n_opath_seen aimed at a user-range address, because the task was
+ * running whatever the freed page had turned into.
+ *
+ * So the count is explicit.  susfs_fp_drain() waits for it to reach zero (phase 1,
+ * covers a task blocked in orig), and only then runs the tasks-RCU drain (phase 2,
+ * covers a body that decremented the count and is still finishing its own epilogue
+ * in module text).
+ *
+ * susfs_fp_enter() returns false once a drain has started; the wrapper must then
+ * call the original directly and must NOT call susfs_fp_leave().  Every path that
+ * returns true has to be paired with exactly one susfs_fp_leave().
+ */
+bool susfs_fp_enter(void);
+void susfs_fp_leave(void);
 #endif /* __SUSFS_FP_HOOK_H */
