@@ -8,6 +8,7 @@
  * parameter is copied to the heap as well so a later supercall can free it safely.
  */
 #include <linux/module.h>
+#include <linux/mutex.h>	/* spoof_lock: serialises spoof_set()/exit */
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include "susfs_abi.h"
@@ -37,34 +38,15 @@ struct retired_str {
 };
 
 static LIST_HEAD(retired_strs);
-/* Serialises publication and the retired list: two concurrent supercalls could otherwise
- * both take the !spoof_active branch and record a FAKE pointer as orig_boot_config, leaving
- * /proc/bootconfig spoofed after unload. */
+
+/* The list is deliberately never drained.  A retired string may still be the pointer a
+ * concurrent /proc/bootconfig reader picked up before the republish, and boot_config_proc_show()
+ * reads saved_boot_config outside any lock of ours, so free()ing it is a use-after-free with no
+ * way to wait for the reader to finish (it is a plain pointer load, not an RCU dereference, so
+ * synchronize_rcu() buys nothing).  The cost is bounded and tiny: 8 KB per set(), and set() only
+ * runs when someone sends CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG (i.e. a human editing the fake
+ * bootconfig in the panel), not from any periodic path. */
 static DEFINE_MUTEX(spoof_lock);
-
-/* Free what nobody can still be reading.  Retiring without ever freeing leaked up to 8 KB
- * per set() for the module's lifetime, unbounded over repeated supercalls and unreachable
- * after unload. */
-static void spoof_drain_retired(void)
-{
-	struct retired_str *r, *tmp;
-	LIST_HEAD(doomed);
-
-	mutex_lock(&spoof_lock);
-	list_splice_init(&retired_strs, &doomed);
-	mutex_unlock(&spoof_lock);
-
-	if (list_empty(&doomed))
-		return;
-
-	susfs_wait_for_readers();
-
-	list_for_each_entry_safe(r, tmp, &doomed, list) {
-		list_del(&r->list);
-		kfree(r->s);
-		kfree(r);
-	}
-}
 
 static void spoof_retire(char *s)
 {
@@ -84,10 +66,16 @@ static int spoof_set(const char *fake)
 {
 	char *dup;
 
+	/* kstrdup() outside the lock: it is the only step that can fail, and holding the lock
+	 * across a GFP_KERNEL allocation buys nothing. */
 	dup = kstrdup(fake, GFP_KERNEL);
 	if (!dup)
 		return -ENOMEM;
 
+	/* From here on the whole read-modify-write is one atomic step.  Without the lock two
+	 * concurrent supercalls can both see spoof_active == false, so the second one records the
+	 * first one's fake string as orig_boot_config and the first one's string is retired even
+	 * though it is still the one that was published - unpublishing then restores a fake. */
 	mutex_lock(&spoof_lock);
 	if (!spoof_active)
 		orig_boot_config = saved_boot_config;
@@ -98,9 +86,6 @@ static int spoof_set(const char *fake)
 	saved_boot_config = dup;
 	spoof_active = true;
 	mutex_unlock(&spoof_lock);
-
-	/* Outside the lock: the wait is unbounded and only the list needs serialising. */
-	spoof_drain_retired();
 	return 0;
 }
 
@@ -123,24 +108,17 @@ int susfs_spoof_cmdline_init(void)
 
 void susfs_spoof_cmdline_exit(void)
 {
-	char *live = NULL;
-
+	/* Unpublish - and deliberately free nothing: a reader that already picked up the pointer can still be printing
+	 * it while this runs, and unload is no exception, so a kfree() here only buys a use-after-free.
+	 * The lock keeps a supercall's task_work from publishing a new string while we are tearing down. */
 	mutex_lock(&spoof_lock);
 	if (spoof_active) {
 		saved_boot_config = orig_boot_config;
 		spoof_active = false;
 		orig_boot_config = NULL;
-		live = fake_boot_config;
 	}
 	fake_boot_config = NULL;
-	if (live)
-		spoof_retire(live);
 	mutex_unlock(&spoof_lock);
-
-	/* The pointer is unpublished now, so wait out whoever may still hold it and then free
-	 * everything this feature allocated - the live buffer included, which used to be
-	 * dropped on the floor at unload along with the whole retired list. */
-	spoof_drain_retired();
 }
 
 /* supercall: CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG */
