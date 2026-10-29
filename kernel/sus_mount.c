@@ -633,9 +633,7 @@ static bool sus_mount_ident_match(struct mount *r)
         const struct sus_mount_ident *e = &mount_ident[i];
         unsigned long e_ino = smp_load_acquire(&e->root_ino);
 
-        if (!e_ino)
-            continue;	/* free or invalidated slot: neither of its keys is valid */
-        if (e_ino == ino && e->s_dev == r->mnt.mnt_sb->s_dev)
+        if (e_ino && e_ino == ino && e->s_dev == r->mnt.mnt_sb->s_dev)
             return true;
         if (e->devname_is_path && devname &&
             (e->devname_truncated
@@ -661,11 +659,6 @@ static void sus_mount_ident_drop_dev(dev_t s_dev)
     spin_lock_irqsave(&ident_lock, flags);
     for (i = 0; i < n_ident; i++) {
         if (smp_load_acquire(&mount_ident[i].root_ino) && mount_ident[i].s_dev == s_dev) {
-            /* The devname arm has to die first: it is tested independently of root_ino, so
-             * clearing only the inode number left the record hiding any mount that reused
-             * the source string - the stale-record bug this whole hook exists to prevent. */
-            mount_ident[i].devname_is_path = false;
-            mount_ident[i].devname[0] = '\0';
             smp_store_release(&mount_ident[i].root_ino, 0);
             atomic_inc(&n_ident_dropped_dev);
         }
@@ -1644,8 +1637,6 @@ static bool sus_mount_path_is_ours(const char *s)
  * afterwards (allocated and freed there, so the pairing the kernel expects stays
  * intact). */
 #define SUS_MOUNT_ID_BATCH 8
-/* Passes of SUS_MOUNT_ID_BATCH each, i.e. the most mounts one enable can mark. */
-#define SUS_MOUNT_SCAN_PASSES 16
 
 /* ---- control surface: which mounts are ours ---- */
 
@@ -2116,8 +2107,7 @@ static const struct proc_ops sus_mount_keep_proc_ops = {
 
 static struct proc_dir_entry *sus_mount_keep_entry;
 
-static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long min,
-                             bool *more)
+static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long min)
 {
     int batch[SUS_MOUNT_ID_BATCH];
     /* The ids the mounts already owned, so they can be handed back to the kernel's ida once
@@ -2132,9 +2122,9 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
     int scan_logged = 0;
     int marked = 0;
     unsigned int n_devname = 0, n_dpath_ok = 0, n_dpath_err = 0;
-    *more = false;
     unsigned int n_skipped_ns = 0, n_skipped_marked = 0;
     bool hit_cap = false;
+    bool failed = false;
     int i;
 
     if (!sus_mount_ns_walk_begin()) {
@@ -2231,9 +2221,9 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         }
 
         if (used >= n_batch) {
-            /* Not an error: the batch is allocated before the lock (ida_alloc_range() may
-             * sleep) and so bounds one pass, not the scan.  The caller runs another pass. */
-            *more = true;
+            pr_warn("sus_mount: id batch exhausted in ns %p, remaining mounts left unmarked\n",
+                    ns);
+            failed = true;
             break;
         }
         new_id = batch[used++];
@@ -2270,6 +2260,9 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
     if (hit_cap)
         pr_warn("sus_mount: walk of ns %p stopped after %u entries (cap %d), result may be incomplete\n",
                 ns, seen, SUS_MOUNT_MAX_SCAN);
+    if (failed)
+        pr_warn("sus_mount: marking in ns %p stopped early, %d mount(s) marked\n",
+                ns, marked);
     SUSFS_LOGI("sus_mount: ns %p: seen=%u devname_hits=%u dpath_ok=%u dpath_err=%u skipped(other ns/cursor)=%u skipped(already marked)=%u marked=%d ids_alloc=%d\n",
             ns, seen, n_devname, n_dpath_ok, n_dpath_err, n_skipped_ns,
             n_skipped_marked, marked, n_batch);
@@ -2280,9 +2273,7 @@ static int sus_mount_mark_ksu_mounts(void)
 {
     char *buf;
     unsigned long min;
-    int marked = 0;
-    int pass;
-    bool more = false;
+    int marked;
 
     /* Fail closed: without all three symbols we cannot own a real id, and a
      * self-made id would leave an ida_free WARN behind on umount. */
@@ -2328,22 +2319,7 @@ static int sus_mount_mark_ksu_mounts(void)
      * through the identity table instead: same superblock, same root dentry, and
      * the hide hooks accept that as well as a KSU-range id, with no cross-namespace
      * walk at all.  That is what closes the leak this file's header describes. */
-    /* One pass is bounded by SUS_MOUNT_ID_BATCH, because the ids have to be allocated before
-     * ns_lock is taken (ida_alloc_range() may sleep).  A module store with more bind mounts
-     * than that left the rest unmarked and visible in /proc/mounts, so run passes until the
-     * scan reports nothing more to mark - capped, so a namespace that grows under us cannot
-     * spin here. */
-    for (pass = 0; pass < SUS_MOUNT_SCAN_PASSES; pass++) {
-        int n = sus_mount_scan_ns(current->nsproxy->mnt_ns, buf, min, &more);
-
-        if (n > 0)
-            marked += n;
-        if (!more)
-            break;
-    }
-    if (more)
-        pr_warn("sus_mount: still more mounts to mark after %d passes (%d marked); raise SUS_MOUNT_SCAN_PASSES or SUS_MOUNT_ID_BATCH\n",
-                SUS_MOUNT_SCAN_PASSES, marked);
+    marked = sus_mount_scan_ns(current->nsproxy->mnt_ns, buf, min);
 
     kfree(buf);
 
