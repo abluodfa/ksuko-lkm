@@ -77,6 +77,9 @@ struct sd_buf {
 	int				count;
 	int				error;
 	bool				compat;
+	/* 被列目录的 inode：contents 规则按 (i_sb->s_dev, i_ino) 判定，父链判定在这里
+	 * 拿不到 dentry，但 fget 出来的 file 正好带着它。 */
+	struct inode			*dir_inode;
 };
 
 static int (*sd_iterate_dir)(struct file *, struct dir_context *);
@@ -95,6 +98,14 @@ static atomic_t n_sd_hidden = ATOMIC_INIT(0);
 static bool sd_name_ok(const char *name, int len)
 {
 	return len > 0 && len < PATH_MAX && !memchr(name, '/', len);
+}
+
+/* "." 和 ".." 必须照常输出：真实文件系统（含 FUSE）的 getdents 都带这两条，
+ * 少了它们比"目录里少几个文件"更显眼。 */
+static bool sd_is_dot(const char *name, int namlen)
+{
+	return (namlen == 1 && name[0] == '.') ||
+	       (namlen == 2 && name[0] == '.' && name[1] == '.');
 }
 
 static SD_RET sd_filldir(struct dir_context *ctx, const char *name, int namlen,
@@ -123,6 +134,15 @@ static SD_RET sd_filldir(struct dir_context *ctx, const char *name, int namlen,
 			atomic_inc(&n_sd_hidden);
 			return SD_GO;
 		}
+	}
+
+	/* contents 规则：被列的目录自己命中规则时，除 "." 和 ".." 之外一律不外发。
+	 * 这一条不依赖 addc 那一刻的目录快照，所以目录里新建的名字当场就不可见，
+	 * 与 stat 面（父链判定）给出同一个答案。 */
+	if (buf->dir_inode && !sd_is_dot(name, namlen) &&
+	    sus_path_dirent_dir_hidden(buf->dir_inode)) {
+		atomic_inc(&n_sd_hidden);
+		return SD_GO;
 	}
 
 	if (!sd_name_ok(name, namlen)) {
@@ -229,6 +249,9 @@ __nocfi bool susfs_dirent_prefilter(const struct pt_regs *regs, long *out,
 		*out = -EBADF;
 		return true;
 	}
+	/* contents 的 readdir 面要的是"被列的是哪个目录"，fget 出来的 file 正好带着它；
+	 * 用 inode 而不是路径字符串，跨文件系统不会误命中。 */
+	buf.dir_inode = f->f_inode;
 
 	/* What fdget_pos() does for the real syscall.  Without it two threads reading one
 	 * shared fd both start from the same f_pos and the listing repeats itself - measured
