@@ -36,6 +36,8 @@
 #include <linux/errno.h>
 #include <linux/delay.h>
 #include <linux/rcupdate.h>
+#include <linux/sched.h>	/* wait_event() */
+#include <linux/wait.h>
 #include <asm/unistd.h>
 
 #include "patch_memory.h"
@@ -73,6 +75,62 @@ static int fp_compat_nr(const struct susfs_fp_hook *h)
 /* One table patch, with the same ordering rule for both tables: the wrapper reads
  * its original out of the module slot, so the slot is published first and the
  * write is verified afterwards. */
+/* ---- module-text lifetime guard ------------------------------------------
+ * The full reasoning is in susfs_fp_hook.h.  In short: a wrapper can be asleep
+ * inside orig(regs) for seconds, and no RCU flavour notices that, so the drain
+ * counts entries explicitly and waits for zero before the tasks-RCU pass.
+ */
+static atomic_t fp_inflight = ATOMIC_INIT(0);
+static wait_queue_head_t fp_drain_wq;
+static bool fp_drain_wq_ready;
+static bool fp_draining;
+/* Set once a table entry could not be restored: that entry belongs to someone else
+ * now, and that someone may still be chaining into our text.  One-way - see
+ * fp_pin_module(). */
+static bool fp_pinned;
+
+static void fp_drain_wq_init(void)
+{
+	if (fp_drain_wq_ready)
+		return;
+	init_waitqueue_head(&fp_drain_wq);
+	fp_drain_wq_ready = true;
+}
+
+bool susfs_fp_enter(void)
+{
+	/* Bumped before the flag is read on purpose: the drain waits for the count
+	 * to reach zero, so an entrant that is about to bail must already be visible
+	 * to it - never the other way round. */
+	atomic_inc(&fp_inflight);
+	if (unlikely(READ_ONCE(fp_draining))) {
+		atomic_dec(&fp_inflight);
+		return false;
+	}
+	return true;
+}
+
+void susfs_fp_leave(void)
+{
+	if (atomic_dec_and_test(&fp_inflight) && READ_ONCE(fp_drain_wq_ready))
+		wake_up_all(&fp_drain_wq);
+}
+
+/* A restored entry stops new callers; an entry that can no longer be restored keeps
+ * a reachable pointer into this module alive.  Pinning is the only answer a module
+ * has: the kernel then refuses to unload it, so nothing can be freed under that
+ * pointer.  The alternative was measured on this device as a panic inside an
+ * unrelated process' openat(). */
+static void fp_pin_module(const struct susfs_fp_hook *h, const char *table, int nr)
+{
+	if (!fp_pinned) {
+		fp_pinned = true;
+		__module_get(THIS_MODULE);
+	}
+	pr_err("susfs_fp: %s: %s[%d] is not ours any more, left alone - module pinned (rmmod will fail with -EBUSY)\n",
+	       h->name, table, nr);
+}
+
 static int fp_patch_entry(susfs_syscall_fn_t *table, int nr, const char *name,
 			  susfs_syscall_fn_t wrapper, susfs_syscall_fn_t old)
 {
@@ -199,6 +257,11 @@ static bool fp_has_landing_pad(const void *fn)
 
 int susfs_fp_install(struct susfs_fp_hook *h)
 {
+	/* A fresh arm clears the drain state: the owning layer may have been torn down
+	 * and re-armed, and a stale "draining" would refuse every call through the
+	 * wrapper.  The pin is deliberately not cleared - it is one-way. */
+	fp_drain_wq_init();
+	WRITE_ONCE(fp_draining, false);
 	susfs_syscall_fn_t old;
 	int cnr, err;
 	bool native_done = false, compat_done = false;
@@ -314,10 +377,24 @@ void susfs_fp_remove(struct susfs_fp_hook *h)
 	cnr = fp_compat_nr(h);
 
 	if (h->nr >= 0 && READ_ONCE(sys_call_table_ptr[h->nr]) != h->wrapper) {
-		pr_warn("susfs_fp: nr %d is not ours any more, leaving it alone\n", h->nr);
+		/* Leaving the entry alone is the only correct thing to do - it points at
+		 * someone else's function now.  But whoever owns it may have chained into
+		 * the address it found here, which is OUR text, and this module is on its
+		 * way out.  So the module is pinned: rmmod then fails with -EBUSY and
+		 * nothing is freed under a live pointer.  Losing the ability to unload
+		 * until the next reboot is the cheap side of that trade; the other side
+		 * was
+		 *     pc : susfs_opath_openat+0x38/0xb4 [susfs_guard_lkm]
+		 * - a panic in a syscall that has nothing to do with this module. */
+		fp_pin_module(h, "sys_call_table", h->nr);
 		h->installed = false;
 		return;
 	}
+	/* The 32-bit half can go the same way, and silently: if it no longer points at
+	 * us, someone else found our address there and may still chain into it. */
+	if (cnr >= 0 && compat_sys_call_table_ptr && h->orig_compat &&
+	    READ_ONCE(compat_sys_call_table_ptr[cnr]) != h->wrapper)
+		fp_pin_module(h, "compat_sys_call_table", cnr);
 
 	if (cnr >= 0 && compat_sys_call_table_ptr && h->orig_compat &&
 	    READ_ONCE(compat_sys_call_table_ptr[cnr]) == h->wrapper) {
@@ -362,16 +439,34 @@ static __nocfi void fp_call_drain(void (*fn)(void))
 
 void susfs_fp_drain(void)
 {
+	fp_drain_wq_init();
+	/* Closing the door first: every caller is supposed to have restored its table
+	 * entries by now, so this only shuts the window on one that raced the restore. */
+	WRITE_ONCE(fp_draining, true);
+	/* Phase 0: RCU read-side sections. */
+	synchronize_rcu();
+	/* Phase 1: nobody left inside a wrapper body.  This is the phase that covers
+	 * what the tasks-RCU drain cannot see - a task parked in orig(regs), which is
+	 * where a wrapper spends almost all of its life and where it is ASLEEP, hence
+	 * quiescent for synchronize_rcu_tasks().  Waiting here is unbounded on purpose:
+	 * giving up would hand the caller exactly the use-after-free this exists to
+	 * prevent, and the entries are already restored so the count can only fall. */
+	if (atomic_read(&fp_inflight))
+		pr_info("susfs_fp: drain waiting for %d wrapper call(s) to return\n",
+			atomic_read(&fp_inflight));
+	wait_event(fp_drain_wq, atomic_read(&fp_inflight) == 0);
+	/* Phase 2: a body that decremented the count is still running its epilogue, and
+	 * that is module text too.  Tasks-RCU does cover it: since the decrement the
+	 * task has neither returned to user mode nor scheduled out, so it is not
+	 * quiescent yet.  There is no msleep() fallback any more - a fixed delay was
+	 * never a barrier, it was the hole this function exists to close. */
 	if (!fp_sync_looked_up) {
 		fp_sync_rcu_tasks_fn = (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
 		fp_sync_looked_up = true;
 		if (!fp_sync_rcu_tasks_fn)
-			pr_warn("susfs_fp: synchronize_rcu_tasks not found, using a delay\n");
+			pr_warn("susfs_fp: synchronize_rcu_tasks not found - phases 0+1 only\n");
 	}
-
-	synchronize_rcu();
 	if (fp_sync_rcu_tasks_fn)
 		fp_call_drain(fp_sync_rcu_tasks_fn);
-	else
-		msleep(50);
+	pr_info("susfs_fp: drained, inflight=%d\n", atomic_read(&fp_inflight));
 }
